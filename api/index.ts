@@ -114,4 +114,4 @@ app.post('/api/notion-page', async (req, res) => {
 
 app.listen(5000, () => console.log('Server ready on port 5000.'));
 
-export default app;
+export { app };
