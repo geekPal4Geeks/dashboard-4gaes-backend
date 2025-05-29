@@ -8,9 +8,9 @@
 	],
 	"builds": [
 		{
-			"src": "dist/index.js",
+			"src": "api/index.js",
 			"use": "@vercel/node",
-			"config": { "includeFiles": ["dist/**"] }
+			"config": { "includeFiles": ["api/**"] }
 		  }
 	]
 }
