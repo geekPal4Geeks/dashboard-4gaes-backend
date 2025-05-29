@@ -5,6 +5,8 @@ const app = express();
 const { sql } = require('@vercel/postgres');
 const { Client, LogLevel } = require('@notionhq/client');
 const cors = require('cors');
+const { NotionAPI } = require('notion-client')
+
 
 const bodyParser = require('body-parser');
 const path = require('path');
@@ -82,6 +84,34 @@ app.post('/api/student-info', async (req, res) => {
     } catch (error) {
         console.error('Error obteniendo información del estudiante:', error);
         res.status(500).json({ error: 'Error al obtener información del estudiante' });
+    }
+});
+
+// Endpoint para obtener el contenido de una página de Notion
+app.post('/api/notion-page', async (req, res) => {
+    try {
+        const { pageId } = req.body;
+
+        if (!pageId) {
+            return res.status(400).json({ error: 'Se requiere el ID de la página de Notion' });
+        }
+
+        // Obtener el contenido de la página
+        const notion = new NotionAPI()
+
+        const recordMap = await notion.getPage(pageId)
+
+        if (!recordMap) {
+            return res.status(404).json({ error: 'Página no encontrada' });
+        }
+
+        // Devolvemos tanto la información de la página como sus bloques
+        res.status(200).json({
+            recordMap
+        });
+    } catch (error) {
+        console.error('Error obteniendo contenido de la página de Notion:', error);
+        res.status(500).json({ error: 'Error al obtener el contenido de la página' });
     }
 });
 
