@@ -7,7 +7,9 @@
         "noImplicitAny": true,
         "moduleResolution": "NodeNext",
         "sourceMap": true,
-        "outDir": "dist",
+        "outDir": "./dist",
+        "rootDir": "./",
+        "strict": true,
         "baseUrl": ".",
         "paths": {
             "*": [
@@ -15,7 +17,6 @@
             ]
         }
     },
-    "include": [
-        "./api/**/*"
-    ]
+    "include": ["api/**/*.ts", "src/**/*.ts"],
+    "exclude": ["node_modules"]
 }
