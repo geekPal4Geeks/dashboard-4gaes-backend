@@ -1,29 +1,32 @@
-require('dotenv').config();
+import express from 'express';
+import { sql } from '@vercel/postgres';
+import { Client, LogLevel } from '@notionhq/client';
+import { NotionAPI } from 'notion-client';
+import cors from 'cors';
+import bodyParser from 'body-parser';
+import path from 'path';
+import dotenv from 'dotenv';
 
-const express = require('express');
+dotenv.config();
+
 const app = express();
-const { sql } = require('@vercel/postgres');
-const { Client, LogLevel } = require('@notionhq/client');
-const cors = require('cors');
-
-const bodyParser = require('body-parser');
-const path = require('path');
-
-// Create application/x-www-form-urlencoded parser
 const urlencodedParser = bodyParser.urlencoded({ extended: false });
 app.use(express.json());
 app.use(cors());
 
-// Configuración del cliente de Notion
+// Configuración del cliente de Notion oficial
 const notion = new Client({
     auth: process.env.NOTION_TOKEN,
     logLevel: LogLevel.DEBUG
 });
 
+// Configuración del NotionAPI de react-notion-x
+const notionX = new NotionAPI();
+
 app.use(express.static('public'));
 
 app.get('/', function (req, res) {
-    res.sendFile(path.join(__dirname, '..', 'components', 'home.htm'));
+    res.sendFile(path.join(process.cwd(), 'components', 'home.htm'));
 });
 
 // Endpoint para obtener información de la cohorte
@@ -36,7 +39,7 @@ app.post('/api/cohort-info', async (req, res) => {
         }
 
         const response = await notion.databases.query({
-            database_id: process.env.NOTION_DATABASE_ID,
+            database_id: process.env.NOTION_DATABASE_ID || '',
             filter: {
                 or: [
                     {
@@ -53,7 +56,6 @@ app.post('/api/cohort-info', async (req, res) => {
             return res.status(404).json({ error: 'Cohorte no encontrada' });
         }
 
-        // Devolvemos solo la información de la cohorte
         res.status(200).json(response.results[0]);
     } catch (error) {
         console.error('Error obteniendo información de Notion:', error);
@@ -84,8 +86,6 @@ app.post('/api/student-info', async (req, res) => {
         res.status(500).json({ error: 'Error al obtener información del estudiante' });
     }
 });
-
-// Endpoint para actualizar una propiedad de un estudiante
 // Endpoint para actualizar una propiedad de un estudiante
 app.put('/api/update-student-property', async (req, res) => {
     try {
@@ -219,4 +219,4 @@ app.post('/api/create-student-comment', async (req, res) => {
 
 app.listen(5000, () => console.log('Server ready on port 5000.'));
 
-module.exports = app;
+export default app;
