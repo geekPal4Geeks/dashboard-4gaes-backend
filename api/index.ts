@@ -114,7 +114,7 @@ app.put('/api/update-student-property', async (req, res) => {
 
         if (numericProperties.includes(propertyName)) {
             // Asegurarse de que el valor sea un número (o null si es vacío)
-            const numericValue = propertyValue === '' || propertyValue === null ? null : Number(propertyValue);
+            const numericValue: any = propertyValue === '' || propertyValue === null ? null : Number(propertyValue);
             if (isNaN(numericValue) && numericValue !== null) {
                  return res.status(400).json({
                     error: `El valor para ${propertyName} debe ser un número.`
@@ -171,10 +171,10 @@ app.put('/api/update-student-property', async (req, res) => {
 
 
         res.status(200).json(updateResponse);
-    } catch (error) {
+    } catch (error: any) {
         console.error('Error actualizando propiedad del estudiante:', error);
         // Capturar errores específicos de la API de Notion si es posible
-        if (error.code === 'validation_error') {
+        if (error.message === 'validation_error') {
              res.status(400).json({ error: `Error de validación en Notion: ${error.message}` });
         } else {
             res.status(500).json({ error: 'Error interno al actualizar la propiedad del estudiante' });
