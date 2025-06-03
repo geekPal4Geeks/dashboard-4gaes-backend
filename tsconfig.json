@@ -4,12 +4,13 @@
         "esModuleInterop": true,
         "allowSyntheticDefaultImports": true,
         "target": "ES2020",
-        "noImplicitAny": true,
+        "noImplicitAny": false,
         "moduleResolution": "NodeNext",
         "sourceMap": true,
         "outDir": "./dist",
         "rootDir": "./",
-        "strict": true,
+        "strict": false,
+        "skipLibCheck": true,
         "baseUrl": ".",
         "paths": {
             "*": [

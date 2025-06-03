@@ -1,43 +1,33 @@
 import express from 'express';
-import { sql } from '@vercel/postgres';
 import { Client, LogLevel } from '@notionhq/client';
 import { NotionAPI } from 'notion-client';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import path from 'path';
 import dotenv from 'dotenv';
-
 dotenv.config();
-
 const app = express();
 const urlencodedParser = bodyParser.urlencoded({ extended: false });
 app.use(express.json());
 app.use(cors());
-
 // Configuración del cliente de Notion oficial
 const notion = new Client({
     auth: process.env.NOTION_TOKEN,
     logLevel: LogLevel.DEBUG
 });
-
 // Configuración del NotionAPI de react-notion-x
 const notionX = new NotionAPI();
-
 app.use(express.static('public'));
-
 app.get('/', function (req, res) {
     res.sendFile(path.join(process.cwd(), 'components', 'home.htm'));
 });
-
 // Endpoint para obtener información de la cohorte
 app.post('/api/cohort-info', async (req, res) => {
     try {
         const { cohortId } = req.body;
-
         if (!cohortId) {
             return res.status(400).json({ error: 'Se requiere el ID de la cohorte' });
         }
-
         const response = await notion.databases.query({
             database_id: process.env.NOTION_DATABASE_ID || '',
             filter: {
@@ -51,37 +41,32 @@ app.post('/api/cohort-info', async (req, res) => {
                 ],
             },
         });
-
         if (!response.results || response.results.length === 0) {
             return res.status(404).json({ error: 'Cohorte no encontrada' });
         }
-
         res.status(200).json(response.results[0]);
-    } catch (error) {
+    }
+    catch (error) {
         console.error('Error obteniendo información de Notion:', error);
         res.status(500).json({ error: 'Error al obtener información de la cohorte' });
     }
 });
-
 // endpoint para obtener información de un estudiante específico
 app.post('/api/student-info', async (req, res) => {
     try {
         const { studentId } = req.body;
-
         if (!studentId) {
             return res.status(400).json({ error: 'Se requiere el ID del estudiante' });
         }
-
         const studentResponse = await notion.pages.retrieve({
             page_id: studentId
         });
-
         if (!studentResponse) {
             return res.status(404).json({ error: 'Estudiante no encontrado' });
         }
-
         res.status(200).json(studentResponse);
-    } catch (error) {
+    }
+    catch (error) {
         console.error('Error obteniendo información del estudiante:', error);
         res.status(500).json({ error: 'Error al obtener información del estudiante' });
     }
@@ -90,16 +75,13 @@ app.post('/api/student-info', async (req, res) => {
 app.put('/api/update-student-property', async (req, res) => {
     try {
         const { studentId, propertyName, propertyValue } = req.body;
-
         if (!studentId || !propertyName || propertyValue === undefined) {
             return res.status(400).json({
                 error: 'Se requieren studentId, propertyName y propertyValue'
             });
         }
-
         // Determinar el tipo de propiedad basado en el nombre y formatear el valor
         let propertyUpdate;
-
         // Propiedades numéricas (Skill review y Absences)
         const numericProperties = [
             'Absences',
@@ -111,10 +93,9 @@ app.put('/api/update-student-property', async (req, res) => {
             'Capacidad resolutiva (Skill review)',
             'Trabajo en equipo (Skill review)',
         ];
-
         if (numericProperties.includes(propertyName)) {
             // Asegurarse de que el valor sea un número (o null si es vacío)
-            const numericValue: any = propertyValue === '' || propertyValue === null ? null : Number(propertyValue);
+            const numericValue = propertyValue === '' || propertyValue === null ? null : Number(propertyValue);
             if (isNaN(numericValue) && numericValue !== null) {
                 return res.status(400).json({
                     error: `El valor para ${propertyName} debe ser un número.`
@@ -157,42 +138,36 @@ app.put('/api/update-student-property', async (req, res) => {
                 }
             };
         }
-
-
         const updateResponse = await notion.pages.update({
             page_id: studentId,
             properties: propertyUpdate
         });
-
         if (!updateResponse) {
             // Dependiendo de la API de Notion, un 400 podría no lanzar un error, manejarlo aquí
             return res.status(400).json({ error: 'Error al actualizar la propiedad en Notion (respuesta vacía)' });
         }
-
-
         res.status(200).json(updateResponse);
-    } catch (error: any) {
+    }
+    catch (error) {
         console.error('Error actualizando propiedad del estudiante:', error);
         // Capturar errores específicos de la API de Notion si es posible
         if (error.message === 'validation_error') {
             res.status(400).json({ error: `Error de validación en Notion: ${error.message}` });
-        } else {
+        }
+        else {
             res.status(500).json({ error: 'Error interno al actualizar la propiedad del estudiante' });
         }
     }
 });
-
 // Endpoint para crear un comentario en la ficha de un estudiante
 app.post('/api/create-student-comment', async (req, res) => {
     try {
         const { studentId, comment } = req.body;
-
         if (!studentId || !comment) {
             return res.status(400).json({
                 error: 'Se requieren studentId y comment'
             });
         }
-
         const response = await notion.comments.create({
             parent: {
                 page_id: studentId
@@ -205,159 +180,16 @@ app.post('/api/create-student-comment', async (req, res) => {
                 }
             ]
         });
-
         if (!response) {
             return res.status(404).json({ error: 'No se pudo crear el comentario' });
         }
-
         res.status(200).json(response);
-    } catch (error) {
+    }
+    catch (error) {
         console.error('Error creando comentario:', error);
         res.status(500).json({ error: 'Error al crear el comentario' });
     }
 });
-
-// Endpoint para buscar un estudiante por correo electrónico
-app.post('/api/search-student-by-email', async (req, res) => {
-    try {
-        const { email } = req.body;
-
-        if (!email) {
-            return res.status(400).json({ error: 'Se requiere el correo electrónico del estudiante' });
-        }
-
-        const response = await notion.databases.query({
-            database_id: process.env.NOTION_STD_DATABASE_ID ?? '',
-            filter: {
-                property: 'Email',
-                email: {
-                    equals: email
-                }
-            }
-        });
-
-        if (!response.results || response.results.length === 0) {
-            return res.status(404).json({ error: 'Estudiante no encontrado' });
-        }
-
-        res.status(200).json(response.results[0]);
-    } catch (error) {
-        console.error('Error buscando estudiante por correo:', error);
-        res.status(500).json({ error: 'Error al buscar el estudiante' });
-    }
-});
-
-// Endpoint para obtener el contenido de una página de Notion usando notion-client (react-notion-x)
-app.post('/api/notion-page', async (req, res) => {
-    try {
-        const { pageId } = req.body;
-        if (!pageId) {
-            return res.status(400).json({ error: 'Se requiere el ID de la página de Notion' });
-        }
-
-        // Usar NotionAPI de react-notion-x para obtener la página y sus bloques
-        const recordMap = await notionX.getPage(pageId);
-
-        if (!recordMap) {
-            return res.status(404).json({ error: 'Página no encontrada' });
-        }
-
-        res.status(200).json({
-            recordMap
-        });
-    } catch (error) {
-        console.error('Error obteniendo contenido de la página de Notion:', error);
-        res.status(500).json({ error: 'Error al obtener el contenido de la página' });
-    }
-});
-
-// Endpoint para cancelar una mentoría
-app.post('/api/cancel-mentorship', async (req, res) => {
-    try {
-        const {
-            cancellationDate,
-            cancellationNotes,
-            cancellationReason,
-            mentorName,
-            originalMentorshipDate,
-            studentId,
-            supliedWithOtherStudent
-        } = req.body;
-
-        console.log('Datos recibidos:', {
-            cancellationDate,
-            cancellationNotes,
-            cancellationReason,
-            mentorName,
-            originalMentorshipDate,
-            studentId,
-            supliedWithOtherStudent
-        });
-
-        // Validar campos requeridos
-        if (!studentId || !cancellationDate || !originalMentorshipDate || !cancellationReason || !mentorName || !supliedWithOtherStudent || !cancellationNotes) {
-            return res.status(400).json({
-                error: 'Faltan campos requeridos: studentId, cancellationDate, originalMentorshipDate, cancellationReason, mentorName, supliedWithOtherStudent y cancellationNotes son obligatorios'
-            });
-        }
-
-        const response = await notion.pages.create({
-            parent: {
-                database_id: process.env.NOTION_CANCELLATIONS_DATABASE_ID || ''
-            },
-            properties: {
-                'Estudiante': {
-                    relation: [{
-                        id: studentId
-                    }]
-                },
-                'Fecha y hora de cancelación': {
-                    date: {
-                        start: cancellationDate
-                    }
-                },
-                'Fecha y hora de mentoría': {
-                    date: {
-                        start: originalMentorshipDate
-                    }
-                },
-                'Motivo de reprogramación': {
-                    select: {
-                        name: cancellationReason
-                    }
-                },
-                'Mentor/a': {
-                    select: {
-                        name: mentorName
-                    }
-                },
-                'Suplido con otro alumno': {
-                    checkbox: supliedWithOtherStudent
-                },
-                'Notas': {
-                    rich_text: [{
-                        text: {
-                            content: cancellationNotes
-                        }
-                    }]
-                }
-            }
-        });
-
-        console.log('Respuesta de Notion:', JSON.stringify(response, null, 2));
-        console.log('ID de la página creada:', response.id);
-
-        res.status(200).json({
-            message: 'Cancelación registrada exitosamente',
-            cancellation: response,
-            pageUrl: response.id
-        });
-    } catch (error) {
-        console.error('Error registrando cancelación de mentoría:', error);
-        res.status(500).json({ error: 'Error al registrar la cancelación de la mentoría' });
-    }
-});
-
 app.listen(5000, () => console.log('Server ready on port 5000.'));
-
 export default app;
+//# sourceMappingURL=index.js.map
