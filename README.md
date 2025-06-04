@@ -26,6 +26,8 @@ Install the Vercel CLI:
 npm i -g vercel
 ```
 
+Note: ehiber needs make the last commit for deployment
+
 Then run the app at the root of the repository:
 
 ```bash
