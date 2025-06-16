@@ -144,7 +144,7 @@ app.put('/api/update-student-property', async (req, res) => {
         // Obtener la página actual de Notion UNA SOLA VEZ al inicio del endpoint
         const currentPage = await notion.pages.retrieve({
             page_id: studentId
-        }) as any; 
+        }) as any;
 
         // Validar que cada propiedad tenga los campos requeridos
         for (const prop of propertiesArray) {
@@ -350,7 +350,7 @@ app.post('/api/create-student-comment', async (req, res) => {
                     const message = `<@${slackId}> ${comment}`;
 
                     // Enviar notificación a Zapier
-                    await fetch('https://hooks.zapier.com/hooks/catch/18465097/uyx26id/', {
+                    await fetch(process.env.ZAPIER_MOCK_INTERVIEW_WEBHOOK_URL || '', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
@@ -375,7 +375,7 @@ app.post('/api/create-student-comment', async (req, res) => {
                 const message = `Hola! <@${notificationData.slackId}> Nos han informado que has cancelado tu sesión de Mock interview, recuerda que debes reprogramarla para continuar con tu proceso de carreras! Un saludo.`;
 
                 // Enviar notificación a Zapier
-                await fetch('https://hooks.zapier.com/hooks/catch/18465097/uyqsh9a/', {
+                await fetch(process.env.ZAPIER_CANCELLATION_WEBHOOK_URL || '', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -384,7 +384,7 @@ app.post('/api/create-student-comment', async (req, res) => {
                         message,
                         slack_id: notificationData.slackId,
                         coach_name: notificationData.coachName,
-                    
+
                     })
                 });
             } catch (zapierError) {
