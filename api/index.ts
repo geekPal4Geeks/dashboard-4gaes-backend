@@ -1,4 +1,5 @@
 import express from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import { sql } from '@vercel/postgres';
 import { Client, LogLevel } from '@notionhq/client';
 import { NotionAPI } from 'notion-client';
@@ -6,6 +7,9 @@ import cors from 'cors';
 import bodyParser from 'body-parser';
 import path from 'path';
 import dotenv from 'dotenv';
+import fetch from 'node-fetch';
+
+
 
 dotenv.config();
 
@@ -29,6 +33,51 @@ app.use((req, res, next) => {
     next();
 });
 
+// Middleware de autenticación
+export async function authMiddleware(req: Request, res: Response, next: NextFunction) {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader) return res.status(401).json({ error: 'No token provided' });
+
+    const token = authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Malformed token' });
+    try {
+        const response = await fetch(`${process.env.BREATHCODE_API_URL}/auth/user/me`, {
+            headers: { Authorization: `Token ${token}` }
+        });
+        if (!response.ok) throw new Error('Invalid token');
+
+        const userData = await response.json();
+        (req as any).user4GeeksData = userData; // Guarda los datos del usuario en la request
+        next();
+    } catch (err) {
+        return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+} 
+
+// Middleware para validar roles permitidos
+function authorizeRoles(notAllowedRoles: string[] = []) {
+    const allowedRoles = ['teacher', 'assistant', 'academy_coordinator', 'country_manager'];
+    return (req: Request, res: Response, next: NextFunction) => {
+      const userRoles = (req as any).user4GeeksData.roles || [];
+      // Si el usuario tiene algún rol explícitamente no permitido, negar acceso
+      const hasNotAllowedRole = userRoles.some(roleObj =>
+        notAllowedRoles.includes(roleObj.role) && roleObj.academy && roleObj.academy.id === 6
+      );
+      if (hasNotAllowedRole) {
+        return res.status(403).json({ message: 'No tienes permisos' });
+      }
+      // Si el usuario NO tiene al menos uno de los roles permitidos, negar acceso
+      const hasAllowedRole = userRoles.some(roleObj =>
+        allowedRoles.includes(roleObj.role) && roleObj.academy && roleObj.academy.id === 6
+      );
+      if (!hasAllowedRole) {
+        return res.status(403).json({ message: 'No tienes permisos (rol no permitido)' });
+      }
+      next();
+    };
+  }
+
+
 // Configuración del cliente de Notion oficial
 const notion = new Client({
     auth: process.env.NOTION_TOKEN,
@@ -44,8 +93,11 @@ app.get('/', function (req, res) {
     res.sendFile(path.join(process.cwd(), 'components', 'home.htm'));
 });
 
+// Aplica el middleware a todas las rutas que empiezan con /api
+app.use('/api', authMiddleware);
+
 // Endpoint para obtener información de la cohorte
-app.post('/api/cohort-info', async (req, res) => {
+app.post('/api/cohort-info', authorizeRoles(), async (req, res) => {
     try {
         const { cohortId } = req.body;
 
@@ -79,7 +131,7 @@ app.post('/api/cohort-info', async (req, res) => {
 });
 
 // Nuevo endpoint para obtener una página de cohorte por su ID (desde la base de datos)
-app.post('/api/cohort-page-by-id', async (req, res) => {
+app.post('/api/cohort-page-by-id', authorizeRoles(), async (req, res) => {
     try {
         const { pageId } = req.body;
 
@@ -103,7 +155,7 @@ app.post('/api/cohort-page-by-id', async (req, res) => {
 });
 
 // endpoint para obtener información de un estudiante específico
-app.post('/api/student-info', async (req, res) => {
+app.post('/api/student-info', authorizeRoles(), async (req, res) => {
     try {
         const { studentId } = req.body;
 
@@ -128,7 +180,7 @@ app.post('/api/student-info', async (req, res) => {
 });
 
 // Endpoint para actualizar una o más propiedades de un estudiante
-app.put('/api/update-student-property', async (req, res) => {
+app.put('/api/update-student-property', authorizeRoles(), async (req, res) => {
     try {
         const { studentId, properties } = req.body;
 
@@ -304,7 +356,7 @@ app.put('/api/update-student-property', async (req, res) => {
 });
 
 // Endpoint para crear un comentario en la ficha de un estudiante
-app.post('/api/create-student-comment', async (req, res) => {
+app.post('/api/create-student-comment', authorizeRoles(), async (req, res) => {
     try {
         const { studentId, comment, notificationData } = req.body;
 
@@ -401,7 +453,7 @@ app.post('/api/create-student-comment', async (req, res) => {
 });
 
 // Endpoint para buscar un estudiante por correo electrónico
-app.post('/api/search-student-by-email', async (req, res) => {
+app.post('/api/search-student-by-email', authorizeRoles(), async (req, res) => {
     try {
         const { email } = req.body;
 
@@ -431,7 +483,7 @@ app.post('/api/search-student-by-email', async (req, res) => {
 });
 
 // Endpoint para obtener el contenido de una página de Notion usando notion-client (react-notion-x)
-app.post('/api/notion-page', async (req, res) => {
+app.post('/api/notion-page', authorizeRoles(), async (req, res) => {
     try {
         const { pageId } = req.body;
         if (!pageId) {
@@ -456,7 +508,7 @@ app.post('/api/notion-page', async (req, res) => {
 });
 
 // Endpoint para cancelar una mentoría
-app.post('/api/cancel-mentorship', async (req, res) => {
+app.post('/api/cancel-mentorship', authorizeRoles(), async (req, res) => {
     try {
         const {
             cancellationDate,
