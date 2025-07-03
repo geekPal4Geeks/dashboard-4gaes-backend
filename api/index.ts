@@ -163,16 +163,31 @@ app.post('/api/student-info', authorizeRoles(), async (req, res) => {
             return res.status(400).json({ error: 'Se requiere el ID del estudiante' });
         }
 
-        const studentResponse = await notion.pages.retrieve({
+        const responseStudent = await notion.pages.retrieve({
             page_id: studentId
         });
 
-        if (!studentResponse) {
+
+        if (!responseStudent) {
             return res.status(404).json({ error: 'Estudiante no encontrado' });
         }
+;
+        let cohort = null;
 
+        // Extraer el ID de la cohorte
+        const cohortRelation = (responseStudent as any).properties?.Cohort?.relation;
+        const cohortId = cohortRelation && cohortRelation.length > 0 ? cohortRelation[0].id : null;
 
-        res.status(200).json(studentResponse);
+        // Si hay cohorte, obtener sus datos
+        if (cohortId) {
+            cohort = await notion.pages.retrieve({ page_id: cohortId });
+        }
+
+        res.status(200).json({
+            student: responseStudent,
+            cohort
+        });
+
     } catch (error) {
         console.error('Error obteniendo información del estudiante:', error);
         res.status(500).json({ error: 'Error al obtener información del estudiante' });
@@ -475,7 +490,22 @@ app.post('/api/search-student-by-email', authorizeRoles(), async (req, res) => {
             return res.status(404).json({ error: 'Estudiante no encontrado' });
         }
 
-        res.status(200).json(response.results[0]);
+        const student = response.results[0];
+        let cohort = null;
+
+        // Extraer el ID de la cohorte
+        const cohortRelation = (student as any).properties?.Cohort?.relation;
+        const cohortId = cohortRelation && cohortRelation.length > 0 ? cohortRelation[0].id : null;
+
+        // Si hay cohorte, obtener sus datos
+        if (cohortId) {
+            cohort = await notion.pages.retrieve({ page_id: cohortId });
+        }
+
+        res.status(200).json({
+            student,
+            cohort
+        });
     } catch (error) {
         console.error('Error buscando estudiante por correo:', error);
         res.status(500).json({ error: 'Error al buscar el estudiante' });
