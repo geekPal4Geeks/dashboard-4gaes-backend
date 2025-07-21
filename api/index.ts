@@ -52,30 +52,30 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
     } catch (err) {
         return res.status(401).json({ error: 'Invalid or expired token' });
     }
-} 
+}
 
 // Middleware para validar roles permitidos
 function authorizeRoles(notAllowedRoles: string[] = []) {
     const allowedRoles = ['teacher', 'assistant', 'academy_coordinator', 'country_manager'];
     return (req: Request, res: Response, next: NextFunction) => {
-      const userRoles = (req as any).user4GeeksData.roles || [];
-      // Si el usuario tiene algún rol explícitamente no permitido, negar acceso
-      const hasNotAllowedRole = userRoles.some(roleObj =>
-        notAllowedRoles.includes(roleObj.role) && roleObj.academy && roleObj.academy.id === 6
-      );
-      if (hasNotAllowedRole) {
-        return res.status(403).json({ message: 'No tienes permisos' });
-      }
-      // Si el usuario NO tiene al menos uno de los roles permitidos, negar acceso
-      const hasAllowedRole = userRoles.some(roleObj =>
-        allowedRoles.includes(roleObj.role) && roleObj.academy && roleObj.academy.id === 6
-      );
-      if (!hasAllowedRole) {
-        return res.status(403).json({ message: 'No tienes permisos (rol no permitido)' });
-      }
-      next();
+        const userRoles = (req as any).user4GeeksData.roles || [];
+        // Si el usuario tiene algún rol explícitamente no permitido, negar acceso
+        const hasNotAllowedRole = userRoles.some(roleObj =>
+            notAllowedRoles.includes(roleObj.role) && roleObj.academy && roleObj.academy.id === 6
+        );
+        if (hasNotAllowedRole) {
+            return res.status(403).json({ message: 'No tienes permisos' });
+        }
+        // Si el usuario NO tiene al menos uno de los roles permitidos, negar acceso
+        const hasAllowedRole = userRoles.some(roleObj =>
+            allowedRoles.includes(roleObj.role) && roleObj.academy && roleObj.academy.id === 6
+        );
+        if (!hasAllowedRole) {
+            return res.status(403).json({ message: 'No tienes permisos (rol no permitido)' });
+        }
+        next();
     };
-  }
+}
 
 
 // Configuración del cliente de Notion oficial
@@ -171,7 +171,7 @@ app.post('/api/student-info', authorizeRoles(), async (req, res) => {
         if (!responseStudent) {
             return res.status(404).json({ error: 'Estudiante no encontrado' });
         }
-;
+        ;
         let cohort = null;
 
         // Extraer el ID de la cohorte
@@ -645,6 +645,55 @@ app.post('/api/cancel-mentorship', authorizeRoles(), async (req, res) => {
         res.status(500).json({ error: 'Error al registrar la cancelación de la mentoría' });
     }
 });
+
+// Endpoint para obtener los comentarios de un estudiante
+app.post('/api/student-comments', authorizeRoles(), async (req, res) => {
+    try {
+        const { studentId } = req.body;
+
+        if (!studentId) {
+            return res.status(400).json({ error: 'Se requiere el ID del estudiante (block_id)' });
+        }
+
+        const response = await notion.comments.list({
+            block_id: studentId,
+        });
+
+        if (!response.results || response.results.length === 0) {
+            return res.status(404).json({ error: 'No se encontraron comentarios para este estudiante' });
+        }
+
+        res.status(200).json(response.results);
+    } catch (error) {
+        console.error('Error obteniendo comentarios de Notion:', error);
+        res.status(500).json({ error: 'Error al obtener los comentarios del estudiante' });
+    }
+});
+
+// Endpoint para obtener un usuario de Notion por su ID
+app.post('/api/notion-user', authorizeRoles(), async (req, res) => {
+    try {
+        const { userId } = req.body;
+
+        if (!userId) {
+            return res.status(400).json({ error: 'Se requiere el ID del usuario de Notion' });
+        }
+
+        const user = await notion.users.retrieve({
+            user_id: userId,
+        });
+
+        if (!user) {
+            return res.status(404).json({ error: 'Usuario de Notion no encontrado' });
+        }
+
+        res.status(200).json(user);
+    } catch (error) {
+        console.error('Error obteniendo usuario de Notion:', error);
+        res.status(500).json({ error: 'Error al obtener el usuario de Notion' });
+    }
+});
+
 
 app.listen(5000, () => console.log('Server ready on port 5000.'));
 
