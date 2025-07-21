@@ -56,7 +56,7 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
 
 // Middleware para validar roles permitidos
 function authorizeRoles(notAllowedRoles: string[] = []) {
-    const allowedRoles = ['teacher', 'assistant', 'academy_coordinator', 'country_manager'];
+    const allowedRoles = ['teacher', 'assistant', 'academy_coordinator', 'country_manager', 'career_support'];
     return (req: Request, res: Response, next: NextFunction) => {
         const userRoles = (req as any).user4GeeksData.roles || [];
         // Si el usuario tiene algún rol explícitamente no permitido, negar acceso
