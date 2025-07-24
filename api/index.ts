@@ -578,11 +578,18 @@ app.post('/api/cancel-mentorship', authorizeRoles(), async (req, res) => {
             return res.status(400).json({ error: 'El tipo de mentoría es requerido' });
         }
 
+        if (!isISODateString(cancellationDate) || !isISODateString(originalMentorshipDate)) {
+            return res.status(400).json({ error: 'Las fechas deben estar en formato ISO (YYYY-MM-DDTHH:mm)' });
+        }
+
 
         // Convertir supliedWithOtherStudent a booleano si es necesario
         const supliedWithOtherStudentBool = typeof supliedWithOtherStudent === 'string'
             ? supliedWithOtherStudent.toLowerCase() === 'true'
             : Boolean(supliedWithOtherStudent);
+
+        const cancellationDateISO = cancellationDate;
+        const originalMentorshipDateISO = originalMentorshipDate;
 
         const response = await notion.pages.create({
             parent: {
@@ -596,12 +603,12 @@ app.post('/api/cancel-mentorship', authorizeRoles(), async (req, res) => {
                 },
                 'Fecha y hora de cancelación': {
                     date: {
-                        start: cancellationDate
+                        start: cancellationDateISO
                     }
                 },
                 'Fecha y hora de mentoría': {
                     date: {
-                        start: originalMentorshipDate
+                        start: originalMentorshipDateISO
                     }
                 },
                 'Motivo de reprogramación': {
@@ -694,6 +701,10 @@ app.post('/api/notion-user', authorizeRoles(), async (req, res) => {
     }
 });
 
+function isISODateString(dateStr: string) {
+    // Verifica si el string es un ISO 8601 válido (YYYY-MM-DDTHH:mm o similar)
+    return typeof dateStr === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(dateStr);
+}
 
 app.listen(5000, () => console.log('Server ready on port 5000.'));
 
