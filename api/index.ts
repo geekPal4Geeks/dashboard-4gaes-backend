@@ -77,6 +77,22 @@ function authorizeRoles(notAllowedRoles: string[] = []) {
     };
 }
 
+// Middleware específico para mentores (solo teachers y coordinadores)
+function authorizeMentors() {
+    const mentorRoles = ['teacher', 'academy_coordinator', 'country_manager'];
+    return (req: Request, res: Response, next: NextFunction) => {
+        const userRoles = (req as any).user4GeeksData.roles || [];
+        // Si el usuario tiene al menos uno de los roles de mentor, permitir acceso
+        const hasMentorRole = userRoles.some(roleObj =>
+            mentorRoles.includes(roleObj.role) && roleObj.academy && roleObj.academy.id === 6
+        );
+        if (!hasMentorRole) {
+            return res.status(403).json({ message: 'Solo los mentores pueden acceder a esta información' });
+        }
+        next();
+    };
+}
+
 
 // Configuración del cliente de Notion oficial
 const notion = new Client({
@@ -698,6 +714,520 @@ app.post('/api/notion-user', authorizeRoles(), async (req, res) => {
     } catch (error) {
         console.error('Error obteniendo usuario de Notion:', error);
         res.status(500).json({ error: 'Error al obtener el usuario de Notion' });
+    }
+});
+
+// Helper para consultar todas las páginas de una base de datos de Notion con paginación
+async function notionQueryAll(databaseId: string, filter: any, sorts?: any[]) {
+    const results: any[] = [];
+    let cursor: string | undefined = undefined;
+
+    do {
+        const page = await notion.databases.query({
+            database_id: databaseId,
+            filter,
+            sorts,
+            start_cursor: cursor
+        } as any);
+        results.push(...page.results);
+        cursor = (page as any).next_cursor || undefined;
+    } while (cursor);
+
+    return results;
+}
+
+// Helper para calcular métricas NPS
+function computeNps(scores: number[]) {
+    if (!scores.length) return { nps: 0, avg: 0, promoters: 0, passives: 0, detractors: 0, count: 0 };
+    const promoters = scores.filter(s => s >= 9).length;
+    const detractors = scores.filter(s => s <= 6).length;
+    const passives = scores.length - promoters - detractors;
+    const nps = Math.round(((promoters / scores.length) - (detractors / scores.length)) * 100);
+    const avg = Math.round((scores.reduce((a, b) => a + b, 0) / scores.length) * 10) / 10;
+    return { nps, avg, promoters, passives, detractors, count: scores.length };
+}
+
+
+// Endpoint para obtener NPS de un mentor
+app.post('/api/mentor-nps', authorizeMentors(), async (req, res) => {
+    try {
+        const {
+            mentorId,
+            startDate,
+            endDate,
+            includePast = true
+        } = req.body;
+
+        if (!mentorId) {
+            return res.status(400).json({ error: 'Se requiere mentorId (page_id del profesor en Notion)' });
+        }
+
+        const NPS_DB = process.env.NOTION_NPS_DATABASE_ID || '';
+        if (!NPS_DB) {
+            return res.status(500).json({ error: 'Falta NOTION_NPS_DATABASE_ID en variables de entorno' });
+        }
+
+        // Construir filtro base por mentor
+        const filter: any = {
+            and: [
+                {
+                    property: 'Teacher',
+                    rollup: {
+                        any: {
+                            relation: {
+                                contains: mentorId
+                            }
+                        }
+                    }
+                }
+            ]
+        };
+
+        // Añadir filtros de fecha si se proporcionan (usando NPS ID como aproximación)
+        if (startDate) {
+            filter.and.push({
+                property: 'NPS ID',
+                title: {
+                    starts_with: startDate.substring(0, 7) // YYYY-MM
+                }
+            });
+        }
+
+        if (endDate) {
+            filter.and.push({
+                property: 'NPS ID',
+                title: {
+                    starts_with: endDate.substring(0, 7)
+                }
+            });
+        }
+
+        // Obtener todas las páginas de NPS del mentor
+        const pages = await notionQueryAll(NPS_DB, filter);
+
+        // Agrupar por cohorte
+        const byCohort = new Map<string, {
+            items: Array<{
+                npsId: string;
+                teacherScore: number;
+                cohortScore: number;
+                total: number;
+                participation: number;
+                tas: Array<{ id: string; name: string }>;
+                taScores: number;
+                cohortId: string;
+                creationDate: string;
+            }>;
+        }>();
+
+        for (const page of pages) {
+            const props = (page as any).properties || {};
+
+            // Extraer datos de la página
+            const npsId = props['NPS ID']?.title?.[0]?.plain_text || '';
+            const cohortRelation = props['Cohorts']?.relation || [];
+            const teacherScore = props['Teacher Score']?.number || 0;
+            const cohortScore = props['Cohort Score']?.number || 0;
+            const total = props['Total']?.number || 0;
+            const participation = props['% Participation']?.formula?.number || 0;
+
+            // Extraer fecha de creación real
+            const creationDate = props['Date of Creation']?.date?.start ||
+                props['Date of Creation']?.rich_text?.[0]?.plain_text ||
+                page.created_time ||
+                npsId; // Fallback al NPS ID si no hay fecha
+
+            // Extraer TAs (puede ser rollup también)
+            const taRelation = props['T.A.']?.relation || props['T.A.']?.rollup?.array || [];
+
+            // Extraer TAs Scores - puede ser number o rich_text
+            let taScores = 0;
+            if (props['TAs Scores']?.number !== undefined) {
+                taScores = props['TAs Scores'].number;
+            } else if (props['TAs Scores']?.rich_text?.[0]?.plain_text) {
+                // Extraer número del texto "Beatriz Solana: 9.20"
+                const taText = props['TAs Scores'].rich_text[0].plain_text;
+                const scoreMatch = taText.match(/(\d+\.?\d*)/);
+                if (scoreMatch) {
+                    taScores = parseFloat(scoreMatch[1]);
+                }
+            }
+
+            // Obtener nombres de TAs
+            const tas = await Promise.all(
+                taRelation.map(async (ta: any) => {
+                    try {
+                        // Si es un rollup, el objeto puede tener una estructura diferente
+                        const taId = ta.id || ta.relation?.id;
+                        if (!taId) {
+                            // Intentar extraer nombre del texto de TAs Scores
+                            if (props['TAs Scores']?.rich_text?.[0]?.plain_text) {
+                                const taText = props['TAs Scores'].rich_text[0].plain_text;
+                                const nameMatch = taText.match(/^([^:]+):/);
+                                if (nameMatch) {
+                                    return { id: 'unknown', name: nameMatch[1].trim() };
+                                }
+                            }
+                            return { id: 'unknown', name: 'TA sin ID' };
+                        }
+
+                        const taPage = await notion.pages.retrieve({ page_id: taId });
+                        const taName = (taPage as any).properties?.Name?.title?.[0]?.plain_text ||
+                            (taPage as any).properties?.Title?.title?.[0]?.plain_text ||
+                            'TA sin nombre';
+                        return { id: taId, name: taName };
+                    } catch (error) {
+                        console.error(`Error obteniendo TA ${ta.id || ta.relation?.id}:`, error);
+                        return { id: ta.id || ta.relation?.id || 'unknown', name: 'TA no encontrado' };
+                    }
+                })
+            );
+
+            // Agrupar por cohorte
+            for (const cohort of cohortRelation) {
+                const cohortId = cohort.id;
+                if (!byCohort.has(cohortId)) {
+                    byCohort.set(cohortId, { items: [] });
+                }
+
+                byCohort.get(cohortId)!.items.push({
+                    npsId,
+                    teacherScore,
+                    cohortScore,
+                    total,
+                    participation,
+                    tas,
+                    taScores,
+                    cohortId, // Añadir cohortId para poder mapear después
+                    creationDate // Añadir fecha de creación
+                });
+            }
+        }
+
+        // Obtener información de cohortes
+        const cohortIds = Array.from(byCohort.keys());
+        const cohortPages = await Promise.all(
+            cohortIds.map(async (id) => {
+                try {
+                    const page = await notion.pages.retrieve({ page_id: id });
+                    return page;
+                } catch (error) {
+                    console.error(`Error obteniendo cohorte ${id}:`, error);
+                    return null;
+                }
+            })
+        );
+
+        // Estados permitidos para mostrar NPS
+        const allowedStatuses = ['Active', 'Final Project', 'Finished'];
+
+        // Procesar resultados
+        const resultActive: any[] = [];
+        const resultPast: any[] = [];
+
+        for (const cohortPage of cohortPages) {
+            if (!cohortPage) continue;
+
+            const cohortId = cohortPage.id;
+            const cohortData = byCohort.get(cohortId);
+            if (!cohortData) continue;
+
+            const items = cohortData.items;
+
+            // Obtener estado de la cohorte
+            const status = (cohortPage as any).properties?.Status?.select?.name || '';
+
+            // Solo procesar cohortes con estados permitidos
+            if (!allowedStatuses.includes(status)) {
+                continue;
+            }
+
+            // Calcular métricas - incluir todos los scores válidos (no solo > 0)
+            const teacherScores = items.map(i => i.teacherScore).filter(s => s !== null && s !== undefined && s >= 0);
+            const cohortScores = items.map(i => i.cohortScore).filter(s => s !== null && s !== undefined && s >= 0);
+            const taScores = items.map(i => i.taScores).filter(s => s !== null && s !== undefined && s >= 0);
+            const participations = items.map(i => i.participation).filter(p => p !== null && p !== undefined && p >= 0);
+
+            const teacherMetrics = computeNps(teacherScores);
+            const cohortMetrics = computeNps(cohortScores);
+            const taMetrics = computeNps(taScores);
+
+            // Obtener nombre de cohorte
+            const cohortName = (cohortPage as any).properties?.Cohort?.title?.[0]?.plain_text ||
+                (cohortPage as any).properties?.Title?.title?.[0]?.plain_text ||
+                'Cohorte sin nombre';
+
+            // Determinar si es activa o pasada
+            const isActive = status === 'Active' || status === 'Final Project';
+            const isPast = status === 'Finished';
+
+            const payload = {
+                cohortId,
+                cohortName,
+                status,
+                metrics: {
+                    teacher: teacherMetrics,
+                    cohort: cohortMetrics,
+                    tas: taMetrics,
+                    participation: {
+                        avg: participations.length > 0 ? Math.round((participations.reduce((a, b) => a + b, 0) / participations.length) * 10) / 10 : 0,
+                        count: participations.length
+                    }
+                },
+                items: items.map(item => ({
+                    npsId: item.npsId,
+                    teacherScore: item.teacherScore,
+                    cohortScore: item.cohortScore,
+                    total: item.total,
+                    participation: item.participation,
+                    tas: item.tas,
+                    taScores: item.taScores
+                })),
+                totalEvaluations: items.length
+            };
+
+            if (isActive) {
+                resultActive.push(payload);
+            } else if (isPast && includePast) {
+                resultPast.push(payload);
+            }
+        }
+
+        // Métricas generales del mentor
+        const allTeacherScores = Array.from(byCohort.values())
+            .flatMap(x => x.items.map(i => i.teacherScore))
+            .filter(s => s !== null && s !== undefined && s >= 0);
+
+        const overall = computeNps(allTeacherScores);
+
+        // Obtener nombre del mentor
+        let mentorName = 'Mentor';
+        try {
+            const mentorPage = await notion.pages.retrieve({ page_id: mentorId });
+            mentorName = (mentorPage as any).properties?.Name?.title?.[0]?.plain_text ||
+                (mentorPage as any).properties?.Title?.title?.[0]?.plain_text ||
+                'Mentor';
+        } catch (error) {
+            console.error('Error obteniendo nombre del mentor:', error);
+        }
+
+        // Organizar datos para visualización por cohorte
+        const visualizationData = {
+            // Datos organizados por cohorte con progresión individual
+            cohorts: [...resultActive, ...resultPast].map(cohort => {
+                const cohortData = byCohort.get(cohort.cohortId);
+                if (!cohortData) return null;
+
+                // Ordenar evaluaciones por fecha real de creación
+                const sortedEvaluations = cohortData.items
+                    .sort((a, b) => new Date(a.creationDate).getTime() - new Date(b.creationDate).getTime())
+                    .map(item => ({
+                        npsId: item.npsId,
+                        date: item.creationDate, // Usar fecha real de creación
+                        teacherScore: item.teacherScore,
+                        cohortScore: item.cohortScore,
+                        taScores: item.taScores,
+                        participation: item.participation,
+                        total: item.total,
+                        tas: item.tas.map(ta => ta.name).join(', ')
+                    }));
+
+                return {
+                    id: cohort.cohortId,
+                    name: cohort.cohortName,
+                    status: cohort.status,
+                    isActive: resultActive.some(c => c.cohortId === cohort.cohortId),
+
+                    // Métricas generales de la cohorte
+                    metrics: {
+                        teacher: {
+                            average: cohort.metrics.teacher.avg,
+                            nps: cohort.metrics.teacher.nps,
+                            totalEvaluations: cohort.metrics.teacher.count
+                        },
+                        cohort: {
+                            average: cohort.metrics.cohort.avg,
+                            nps: cohort.metrics.cohort.nps,
+                            totalEvaluations: cohort.metrics.cohort.count
+                        },
+                        participation: {
+                            average: cohort.metrics.participation.avg,
+                            totalEvaluations: cohort.metrics.participation.count
+                        }
+                    },
+
+                    // Progresión temporal individual de la cohorte
+                    progression: {
+                        teacher: sortedEvaluations.map(evaluation => ({
+                            date: evaluation.date,
+                            score: evaluation.teacherScore,
+                            evaluationId: evaluation.npsId
+                        })),
+                        cohort: sortedEvaluations.map(evaluation => ({
+                            date: evaluation.date,
+                            score: evaluation.cohortScore,
+                            evaluationId: evaluation.npsId
+                        })),
+                        participation: sortedEvaluations.map(evaluation => ({
+                            date: evaluation.date,
+                            participation: evaluation.participation,
+                            evaluationId: evaluation.npsId
+                        }))
+                    },
+
+                    // Evaluaciones detalladas
+                    evaluations: sortedEvaluations,
+                    totalEvaluations: cohort.totalEvaluations
+                };
+            }).filter(Boolean), // Filtrar nulls
+
+            // Datos para gráficos comparativos
+            charts: {
+                // Promedios por cohorte (barras)
+                averagesByCohort: [...resultActive, ...resultPast].map(cohort => ({
+                    name: cohort.cohortName,
+                    teacherAverage: cohort.metrics.teacher.avg,
+                    cohortAverage: cohort.metrics.cohort.avg,
+                    status: cohort.status,
+                    isActive: resultActive.some(c => c.cohortId === cohort.cohortId)
+                })),
+
+                // Participación por cohorte
+                participationByCohort: [...resultActive, ...resultPast].map(cohort => ({
+                    name: cohort.cohortName,
+                    participation: cohort.metrics.participation.avg,
+                    evaluations: cohort.totalEvaluations,
+                    status: cohort.status
+                }))
+            },
+
+            // Datos para tablas
+            tables: {
+                // Tabla de cohortes
+                cohorts: [...resultActive, ...resultPast].map(cohort => ({
+                    id: cohort.cohortId,
+                    name: cohort.cohortName,
+                    status: cohort.status,
+                    teacherAverage: cohort.metrics.teacher.avg,
+                    cohortAverage: cohort.metrics.cohort.avg,
+                    participation: cohort.metrics.participation.avg,
+                    evaluations: cohort.totalEvaluations,
+                    isActive: resultActive.some(c => c.cohortId === cohort.cohortId)
+                })),
+
+                // Tabla de evaluaciones recientes (últimas 10 de todas las cohortes)
+                recentEvaluations: Array.from(byCohort.values())
+                    .flatMap(x => x.items)
+                    .sort((a, b) => new Date(b.creationDate).getTime() - new Date(a.creationDate).getTime())
+                    .slice(0, 10)
+                    .map(item => {
+                        const cohortPage = cohortPages.find(c => c?.id === item.cohortId);
+                        const cohortName = cohortPage ?
+                            (cohortPage as any).properties?.Cohort?.title?.[0]?.plain_text ||
+                            (cohortPage as any).properties?.Name?.title?.[0]?.plain_text ||
+                            (cohortPage as any).properties?.Title?.title?.[0]?.plain_text ||
+                            'Cohorte' : 'Cohorte';
+                        return {
+                            npsId: item.npsId,
+                            cohortName,
+                            date: item.creationDate, // Añadir fecha de creación del NPS
+                            teacherScore: item.teacherScore,
+                            cohortScore: item.cohortScore,
+                            total: item.total,
+                            participation: item.participation,
+                            taScores: item.taScores,
+                            tas: item.tas.map(ta => ta.name).join(', ')
+                        };
+                    })
+            },
+
+            // Datos para KPIs
+            kpis: {
+                overallTeacherAverage: overall.avg,
+                overallCohortAverage: Array.from(byCohort.values())
+                    .flatMap(x => x.items.map(i => i.cohortScore))
+                    .filter(s => s > 0)
+                    .reduce((a, b) => a + b, 0) /
+                    Array.from(byCohort.values())
+                        .flatMap(x => x.items.map(i => i.cohortScore))
+                        .filter(s => s > 0).length || 0,
+                totalEvaluations: pages.length,
+                totalCohorts: resultActive.length + resultPast.length,
+                activeCohorts: resultActive.length,
+                finishedCohorts: resultPast.length,
+                averageParticipation: Array.from(byCohort.values())
+                    .flatMap(x => x.items.map(i => i.participation))
+                    .filter(p => p > 0)
+                    .reduce((a, b) => a + b, 0) /
+                    Array.from(byCohort.values())
+                        .flatMap(x => x.items.map(i => i.participation))
+                        .filter(p => p > 0).length || 0
+            },
+
+            // Metadatos
+            metadata: {
+                mentorId,
+                mentorName,
+                lastUpdated: new Date().toISOString(),
+                dataPoints: {
+                    totalEvaluations: pages.length,
+                    totalCohorts: resultActive.length + resultPast.length,
+                    activeCohorts: resultActive.length,
+                    pastCohorts: resultPast.length
+                }
+            }
+        };
+
+        // Asegurar que visualizationData siempre tenga una estructura válida
+        const safeVisualizationData = {
+            cohorts: visualizationData.cohorts || [],
+            charts: {
+                averagesByCohort: visualizationData.charts?.averagesByCohort || [],
+                participationByCohort: visualizationData.charts?.participationByCohort || []
+            },
+            tables: {
+                cohorts: visualizationData.tables?.cohorts || [],
+                recentEvaluations: visualizationData.tables?.recentEvaluations || []
+            },
+            kpis: {
+                overallTeacherAverage: visualizationData.kpis?.overallTeacherAverage || 0,
+                overallCohortAverage: visualizationData.kpis?.overallCohortAverage || 0,
+                totalEvaluations: visualizationData.kpis?.totalEvaluations || 0,
+                totalCohorts: visualizationData.kpis?.totalCohorts || 0,
+                activeCohorts: visualizationData.kpis?.activeCohorts || 0,
+                finishedCohorts: visualizationData.kpis?.finishedCohorts || 0,
+                averageParticipation: visualizationData.kpis?.averageParticipation || 0
+            },
+            metadata: {
+                mentorId,
+                mentorName,
+                lastUpdated: new Date().toISOString(),
+                dataPoints: {
+                    totalEvaluations: pages.length,
+                    totalCohorts: resultActive.length + resultPast.length,
+                    activeCohorts: resultActive.length,
+                    pastCohorts: resultPast.length
+                }
+            }
+        };
+
+        res.status(200).json({
+            activeCohorts: resultActive,
+            pastCohorts: resultPast,
+            overall: {
+                teacherAverage: overall.avg,
+                totalEvaluations: overall.count
+            },
+            totalCohorts: resultActive.length + resultPast.length,
+            totalEvaluations: pages.length,
+            mentorId,
+            mentorName,
+            visualizationData: safeVisualizationData
+        });
+
+    } catch (error) {
+        console.error('Error obteniendo NPS del mentor:', error);
+        res.status(500).json({ error: 'Error al obtener NPS del mentor' });
     }
 });
 
