@@ -78,17 +78,27 @@ function authorizeRoles(notAllowedRoles: string[] = []) {
 }
 
 // Middleware específico para mentores (solo teachers y coordinadores)
-function authorizeMentors() {
-    const mentorRoles = ['teacher', 'academy_coordinator', 'country_manager'];
+// function authorizeMentors() {
+//     const mentorRoles = ['teacher', 'academy_coordinator', 'country_manager'];
+//     return (req: Request, res: Response, next: NextFunction) => {
+//         const userRoles = (req as any).user4GeeksData.roles || [];
+//         // Si el usuario tiene al menos uno de los roles de mentor, permitir acceso
+//         const hasMentorRole = userRoles.some(roleObj =>
+//             mentorRoles.includes(roleObj.role) && roleObj.academy && roleObj.academy.id === 6
+//         );
+//         if (!hasMentorRole) {
+//             return res.status(403).json({ message: 'Solo los mentores pueden acceder a esta información' });
+//         }
+//         next();
+//     };
+// }
+
+function authorizeTeachersOrAssistants() {
+    const allowed = ['teacher', 'assistant'];
     return (req: Request, res: Response, next: NextFunction) => {
-        const userRoles = (req as any).user4GeeksData.roles || [];
-        // Si el usuario tiene al menos uno de los roles de mentor, permitir acceso
-        const hasMentorRole = userRoles.some(roleObj =>
-            mentorRoles.includes(roleObj.role) && roleObj.academy && roleObj.academy.id === 6
-        );
-        if (!hasMentorRole) {
-            return res.status(403).json({ message: 'Solo los mentores pueden acceder a esta información' });
-        }
+        const roles = (req as any).user4GeeksData?.roles || [];
+        const hasAllowed = roles.some((r: any) => allowed.includes(r.role));
+        if (!hasAllowed) return res.status(403).json({ message: 'Requiere rol teacher o assistant' });
         next();
     };
 }
@@ -693,6 +703,122 @@ app.post('/api/student-comments', authorizeRoles(), async (req, res) => {
     }
 });
 
+// Endpoint para obtener los comentarios de una evaluación NPS
+app.post('/api/nps-comments', authorizeTeachersOrAssistants(), async (req, res) => {
+    try {
+        const { npsId } = req.body;
+
+        if (!npsId) {
+            return res.status(400).json({ error: 'Se requiere el NPS ID' });
+        }
+
+        // Verificar que la evaluación pertenece al mentor autenticado
+        const NPS_DB = process.env.NOTION_NPS_DATABASE_ID || '';
+        if (!NPS_DB) {
+            return res.status(500).json({ error: 'Falta NOTION_NPS_DATABASE_ID en variables de entorno' });
+        }
+
+        // Obtener el mentorId del usuario autenticado
+        let mentorId: string;
+        try {
+            mentorId = await resolveMentorIdFromReq(req);
+        } catch (error: any) {
+            return res.status(400).json({ error: error.message });
+        }
+
+        // Buscar la evaluación por NPS ID (título)
+        const evaluationQuery = await notion.databases.query({
+            database_id: NPS_DB,
+            filter: {
+                property: 'NPS ID',
+                title: {
+                    equals: npsId.toString()
+                }
+            }
+        });
+
+        if (!evaluationQuery.results || evaluationQuery.results.length === 0) {
+            return res.status(404).json({ error: 'Evaluación NPS no encontrada con ese NPS ID' });
+        }
+
+        const evaluation = evaluationQuery.results[0] as any;
+        const notionPageId = evaluation.id;
+
+        console.log('🔍 [NPS Comments] Buscando comentarios para:');
+        console.log('   - NPS ID:', npsId);
+        console.log('   - Notion Page ID:', notionPageId);
+
+        // Obtener comentarios de la página NPS
+        const response = await notion.comments.list({
+            block_id: notionPageId,
+        });
+
+        console.log('📝 [NPS Comments] Comentarios encontrados:', response.results?.length || 0);
+        if (response.results && response.results.length > 0) {
+            console.log('   - Comentarios:', JSON.stringify(response.results, null, 2));
+        }
+
+        if (!response.results || response.results.length === 0) {
+            return res.status(200).json({
+                comments: [],
+                message: 'No se encontraron comentarios para esta evaluación NPS'
+            });
+        }
+
+        // Enriquecer comentarios con información del autor
+        const enrichedComments = await Promise.all(
+            response.results.map(async (comment: any) => {
+                try {
+                    const authorId = comment.created_by?.id;
+                    if (authorId) {
+                        const author = await notion.users.retrieve({ user_id: authorId });
+                        return {
+                            ...comment,
+                            author: {
+                                id: author.id,
+                                name: author.name,
+                                avatar_url: author.avatar_url,
+                                type: author.type
+                            }
+                        };
+                    }
+                    return comment;
+                } catch (error) {
+                    console.error('Error obteniendo información del autor:', error);
+                    return comment;
+                }
+            })
+        );
+
+        console.log('✅ [NPS Comments] Respuesta final:');
+        console.log('   - NPS ID:', npsId);
+        console.log('   - Notion Page ID:', notionPageId);
+        console.log('   - Total comentarios:', enrichedComments.length);
+        console.log('   - Comentarios enriquecidos:', JSON.stringify(enrichedComments, null, 2));
+
+        res.status(200).json({
+            comments: enrichedComments,
+            npsId: npsId,
+            notionPageId: notionPageId,
+            totalComments: enrichedComments.length
+        });
+
+    } catch (error: any) {
+        console.error('Error obteniendo comentarios de NPS:', error);
+
+        if (error.code === 'object_not_found') {
+            return res.status(404).json({
+                error: 'Evaluación NPS no encontrada'
+            });
+        }
+
+        res.status(500).json({
+            error: 'Error al obtener los comentarios de la evaluación NPS',
+            details: error.message
+        });
+    }
+});
+
 // Endpoint para obtener un usuario de Notion por su ID
 app.post('/api/notion-user', authorizeRoles(), async (req, res) => {
     try {
@@ -747,19 +873,30 @@ function computeNps(scores: number[]) {
     return { nps, avg, promoters, passives, detractors, count: scores.length };
 }
 
+async function resolveMentorIdFromReq(req: Request): Promise<string> {
+    const email = (req as any).user4GeeksData?.email;
+    if (!email) throw new Error('No se encontró email en el token');
+
+    const MENTORS_DB = process.env.NOTION_MENTORS_DATABASE_ID || '';
+    if (!MENTORS_DB) throw new Error('Falta NOTION_MENTORS_DATABASE_ID');
+
+    const result = await notion.databases.query({
+        database_id: MENTORS_DB,
+        filter: { property: 'Correo', email: { equals: email } }
+    });
+
+    if (!result.results?.length) throw new Error('Mentor no encontrado');
+    return result.results[0].id; // <- Este es el mismo id que ves en /api/mentors/me
+}
 
 // Endpoint para obtener NPS de un mentor
-app.post('/api/mentor-nps', authorizeMentors(), async (req, res) => {
+app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) => {
     try {
-        const {
-            mentorId,
-            startDate,
-            endDate,
-            includePast = true
-        } = req.body;
+        const { mentorId: mentorIdFromBody, startDate, endDate, includePast = true } = req.body;
 
+        let mentorId = mentorIdFromBody;
         if (!mentorId) {
-            return res.status(400).json({ error: 'Se requiere mentorId (page_id del profesor en Notion)' });
+            mentorId = await resolveMentorIdFromReq(req);
         }
 
         const NPS_DB = process.env.NOTION_NPS_DATABASE_ID || '';
@@ -805,6 +942,60 @@ app.post('/api/mentor-nps', authorizeMentors(), async (req, res) => {
         // Obtener todas las páginas de NPS del mentor
         const pages = await notionQueryAll(NPS_DB, filter);
 
+        // Obtener comentarios para todas las evaluaciones
+        const commentsMap = new Map<string, any[]>();
+
+        for (const page of pages) {
+            const props = (page as any).properties || {};
+            const npsId = props['NPS ID']?.title?.[0]?.plain_text || '';
+
+            if (npsId) {
+                try {
+                    const notionPageId = page.id;
+                    const commentsResponse = await notion.comments.list({
+                        block_id: notionPageId,
+                    });
+
+                    if (commentsResponse.results && commentsResponse.results.length > 0) {
+                        // Tomar solo el primer comentario
+                        const firstComment = commentsResponse.results[0];
+                        const firstCommentText = firstComment.rich_text?.[0]?.plain_text || '';
+
+                        // Enriquecer el primer comentario con información del autor
+                        try {
+                            const authorId = firstComment.created_by?.id;
+                            if (authorId) {
+                                const author = await notion.users.retrieve({ user_id: authorId });
+                                const enrichedComment = {
+                                    ...firstComment,
+                                    author: {
+                                        id: author.id,
+                                        name: author.name,
+                                        avatar_url: author.avatar_url,
+                                        type: author.type
+                                    }
+                                };
+                                commentsMap.set(npsId, [enrichedComment]);
+
+                                // Log del contenido del comentario extraído
+                                console.log(`📝 [NPS ${npsId}] Comentario: "${firstCommentText.substring(0, 100)}..."`);
+                            } else {
+                                commentsMap.set(npsId, [firstComment]);
+                            }
+                        } catch (error) {
+                            console.error('Error obteniendo información del autor:', error);
+                            commentsMap.set(npsId, [firstComment]);
+                        }
+                    } else {
+                        commentsMap.set(npsId, []);
+                    }
+                } catch (error) {
+                    console.error(`Error obteniendo comentarios para ${npsId}:`, error);
+                    commentsMap.set(npsId, []);
+                }
+            }
+        }
+
         // Agrupar por cohorte
         const byCohort = new Map<string, {
             items: Array<{
@@ -817,6 +1008,8 @@ app.post('/api/mentor-nps', authorizeMentors(), async (req, res) => {
                 taScores: number;
                 cohortId: string;
                 creationDate: string;
+                visto: boolean;
+                comments: any[];
             }>;
         }>();
 
@@ -830,6 +1023,10 @@ app.post('/api/mentor-nps', authorizeMentors(), async (req, res) => {
             const cohortScore = props['Cohort Score']?.number || 0;
             const total = props['Total']?.number || 0;
             const participation = props['% Participation']?.formula?.number || 0;
+            const visto = props['Visto']?.checkbox || false;
+            const comments = commentsMap.get(npsId) || [];
+
+
 
             // Extraer fecha de creación real
             const creationDate = props['Date of Creation']?.date?.start ||
@@ -898,8 +1095,11 @@ app.post('/api/mentor-nps', authorizeMentors(), async (req, res) => {
                     participation,
                     tas,
                     taScores,
-                    cohortId, // Añadir cohortId para poder mapear después
-                    creationDate // Añadir fecha de creación
+                    cohortId,
+                    creationDate,
+                    visto,
+                    comments: commentsMap.get(npsId) || []
+                    
                 });
             }
         }
@@ -981,7 +1181,9 @@ app.post('/api/mentor-nps', authorizeMentors(), async (req, res) => {
                     total: item.total,
                     participation: item.participation,
                     tas: item.tas,
-                    taScores: item.taScores
+                    taScores: item.taScores,
+                    visto: item.visto,
+                    comments: commentsMap.get(item.npsId) || []
                 })),
                 totalEvaluations: items.length
             };
@@ -1029,7 +1231,8 @@ app.post('/api/mentor-nps', authorizeMentors(), async (req, res) => {
                         taScores: item.taScores,
                         participation: item.participation,
                         total: item.total,
-                        tas: item.tas.map(ta => ta.name).join(', ')
+                        tas: item.tas.map(ta => ta.name).join(', '),
+                        comments: commentsMap.get(item.npsId) || []
                     }));
 
                 return {
@@ -1076,7 +1279,11 @@ app.post('/api/mentor-nps', authorizeMentors(), async (req, res) => {
                     },
 
                     // Evaluaciones detalladas
-                    evaluations: sortedEvaluations,
+                    evaluations: sortedEvaluations.map(evaluation => ({
+                        ...evaluation,
+                        visto: cohortData.items.find(item => item.npsId === evaluation.npsId)?.visto || false,
+                        comments: commentsMap.get(evaluation.npsId) || []
+                    })),
                     totalEvaluations: cohort.totalEvaluations
                 };
             }).filter(Boolean), // Filtrar nulls
@@ -1136,7 +1343,9 @@ app.post('/api/mentor-nps', authorizeMentors(), async (req, res) => {
                             total: item.total,
                             participation: item.participation,
                             taScores: item.taScores,
-                            tas: item.tas.map(ta => ta.name).join(', ')
+                            tas: item.tas.map(ta => ta.name).join(', '),
+                            visto: item.visto,
+                            comments: commentsMap.get(item.npsId) || []
                         };
                     })
             },
@@ -1222,12 +1431,141 @@ app.post('/api/mentor-nps', authorizeMentors(), async (req, res) => {
             totalEvaluations: pages.length,
             mentorId,
             mentorName,
-            visualizationData: safeVisualizationData
+            visualizationData: safeVisualizationData,
+            totalComments: Array.from(commentsMap.values()).flat().length
         });
 
-    } catch (error) {
-        console.error('Error obteniendo NPS del mentor:', error);
-        res.status(500).json({ error: 'Error al obtener NPS del mentor' });
+    } catch (err: any) {
+        console.error('Error obteniendo NPS del mentor:', err);
+        res.status(500).json({ error: 'Error al obtener NPS del mentor', details: err?.message });
+    }
+});
+
+// Endpoint para actualizar el estado "Visto" de una evaluación NPS
+app.put('/api/mentor-nps/evaluation-seen', authorizeTeachersOrAssistants(), async (req, res) => {
+    try {
+        const { evaluationId, seen } = req.body;
+
+        // Validar parámetros requeridos
+        if (!evaluationId) {
+            return res.status(400).json({ error: 'Se requiere evaluationId (NPS ID)' });
+        }
+
+        if (typeof seen !== 'boolean') {
+            return res.status(400).json({ error: 'El campo seen debe ser un booleano' });
+        }
+
+        // Verificar que la evaluación pertenece al mentor autenticado
+        const NPS_DB = process.env.NOTION_NPS_DATABASE_ID || '';
+        if (!NPS_DB) {
+            return res.status(500).json({ error: 'Falta NOTION_NPS_DATABASE_ID en variables de entorno' });
+        }
+
+        // Obtener el mentorId del usuario autenticado
+        let mentorId: string;
+        try {
+            mentorId = await resolveMentorIdFromReq(req);
+        } catch (error: any) {
+            return res.status(400).json({ error: error.message });
+        }
+
+        // Buscar la evaluación por NPS ID (título)
+        const evaluationQuery = await notion.databases.query({
+            database_id: NPS_DB,
+            filter: {
+                property: 'NPS ID',
+                title: {
+                    equals: evaluationId.toString()
+                }
+            }
+        });
+
+        if (!evaluationQuery.results || evaluationQuery.results.length === 0) {
+            return res.status(404).json({ error: 'Evaluación NPS no encontrada con ese NPS ID' });
+        }
+
+        const evaluation = evaluationQuery.results[0] as any;
+        const notionPageId = evaluation.id;
+
+
+        // Actualizar la propiedad "Visto"
+        const updateResponse = await notion.pages.update({
+            page_id: notionPageId,
+            properties: {
+                'Visto': {
+                    checkbox: seen
+                }
+            }
+        });
+
+        if (!updateResponse) {
+            return res.status(500).json({ error: 'Error al actualizar la evaluación' });
+        }
+
+        res.status(200).json({
+            message: 'Estado de evaluación actualizado correctamente',
+            npsId: evaluationId,
+            notionPageId: notionPageId,
+            seen,
+            updatedAt: new Date().toISOString()
+        });
+
+    } catch (error: any) {
+        console.error('Error actualizando estado de evaluación NPS:', error);
+
+        // Manejar errores específicos de Notion
+        if (error.code === 'validation_error') {
+            return res.status(400).json({
+                error: 'Error de validación en Notion',
+                details: error.message
+            });
+        }
+
+        if (error.code === 'object_not_found') {
+            return res.status(404).json({
+                error: 'Evaluación NPS no encontrada'
+            });
+        }
+
+        res.status(500).json({
+            error: 'Error al actualizar el estado de la evaluación',
+            details: error.message
+        });
+    }
+});
+
+app.get('/api/mentors/me', authorizeTeachersOrAssistants(), async (req, res) => {
+    try {
+        const email = (req as any).user4GeeksData?.email;
+        if (!email) return res.status(400).json({ error: 'No se encontró email en el token' });
+
+        const MENTORS_DB = process.env.NOTION_MENTORS_DATABASE_ID || '';
+        if (!MENTORS_DB) return res.status(500).json({ error: 'Falta NOTION_MENTORS_DATABASE_ID' });
+
+        const result = await notion.databases.query({
+            database_id: MENTORS_DB,
+            filter: { property: 'Correo', email: { equals: email } }
+        });
+
+        if (!result.results?.length) return res.status(404).json({ error: 'Mentor no encontrado' });
+
+        const page = result.results[0] as any;
+        const name =
+            page.properties?.Name?.title?.[0]?.plain_text ||
+            page.properties?.Title?.title?.[0]?.plain_text ||
+            [(req as any).user4GeeksData?.first_name, (req as any).user4GeeksData?.last_name]
+                .filter(Boolean)
+                .join(' ') ||
+            (req as any).user4GeeksData?.username;
+
+        res.status(200).json({
+            id: page.id,
+            name: name?.trim() || null,
+            email
+        });
+    } catch (err) {
+        console.error('Error consultando mentor:', err);
+        res.status(500).json({ error: 'Error al consultar mentor' });
     }
 });
 
