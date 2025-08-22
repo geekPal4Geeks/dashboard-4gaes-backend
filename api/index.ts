@@ -904,21 +904,51 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             return res.status(500).json({ error: 'Falta NOTION_NPS_DATABASE_ID en variables de entorno' });
         }
 
-        // Construir filtro base por mentor
-        const filter: any = {
-            and: [
-                {
-                    property: 'Teacher',
-                    rollup: {
-                        any: {
-                            relation: {
-                                contains: mentorId
+        // Determinar el rol del usuario autenticado
+        const userRoles = (req as any).user4GeeksData?.roles || [];
+        const isAssistant = userRoles.some((roleObj: any) =>
+            roleObj.role === 'assistant' && roleObj.academy && roleObj.academy.id === 6
+        );
+        const isTeacher = userRoles.some((roleObj: any) =>
+            roleObj.role === 'teacher' && roleObj.academy && roleObj.academy.id === 6
+        );
+
+        // Construir filtro base según el rol
+        let filter: any;
+
+        if (isAssistant) {
+            // Para assistants, usar la propiedad T.A.
+            filter = {
+                and: [
+                    {
+                        property: 'T.A.',
+                        rollup: {
+                            any: {
+                                relation: {
+                                    contains: mentorId
+                                }
                             }
                         }
                     }
-                }
-            ]
-        };
+                ]
+            };
+        } else {
+            // Para teachers, usar la propiedad Teacher (comportamiento actual)
+            filter = {
+                and: [
+                    {
+                        property: 'Teacher',
+                        rollup: {
+                            any: {
+                                relation: {
+                                    contains: mentorId
+                                }
+                            }
+                        }
+                    }
+                ]
+            };
+        }
 
         // Añadir filtros de fecha si se proporcionan (usando NPS ID como aproximación)
         if (startDate) {
@@ -938,6 +968,11 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                 }
             });
         }
+
+        console.log('🔍 [Mentor NPS] Filtro construido:');
+        console.log('   - Rol detectado:', isAssistant ? 'Assistant' : 'Teacher');
+        console.log('   - Mentor ID:', mentorId);
+        console.log('   - Filtro:', JSON.stringify(filter, null, 2));
 
         // Obtener todas las páginas de NPS del mentor
         const pages = await notionQueryAll(NPS_DB, filter);
@@ -1039,8 +1074,8 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
 
             // Extraer TAs Scores - puede ser number o rich_text
             let taScores = 0;
-            if (props['TAs Scores']?.number !== undefined) {
-                taScores = props['TAs Scores'].number;
+            if (props['TA Score']?.formula?.number !== undefined) {
+                taScores = props['TA Score']?.formula?.number;
             } else if (props['TAs Scores']?.rich_text?.[0]?.plain_text) {
                 // Extraer número del texto "Beatriz Solana: 9.20"
                 const taText = props['TAs Scores'].rich_text[0].plain_text;
@@ -1099,7 +1134,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                     creationDate,
                     visto,
                     comments: commentsMap.get(npsId) || []
-                    
+
                 });
             }
         }
@@ -1196,11 +1231,20 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         }
 
         // Métricas generales del mentor
-        const allTeacherScores = Array.from(byCohort.values())
-            .flatMap(x => x.items.map(i => i.teacherScore))
-            .filter(s => s !== null && s !== undefined && s >= 0);
+        let allScores: number[];
+        if (isAssistant) {
+            // Para assistants, usar TA Score
+            allScores = Array.from(byCohort.values())
+                .flatMap(x => x.items.map(i => i.taScores))
+                .filter(s => s !== null && s !== undefined && s >= 0);
+        } else {
+            // Para teachers, usar Teacher Score
+            allScores = Array.from(byCohort.values())
+                .flatMap(x => x.items.map(i => i.teacherScore))
+                .filter(s => s !== null && s !== undefined && s >= 0);
+        }
 
-        const overall = computeNps(allTeacherScores);
+        const overall = computeNps(allScores);
 
         // Obtener nombre del mentor
         let mentorName = 'Mentor';
@@ -1253,6 +1297,11 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                             nps: cohort.metrics.cohort.nps,
                             totalEvaluations: cohort.metrics.cohort.count
                         },
+                        tas: {
+                            average: cohort.metrics.tas.avg,
+                            nps: cohort.metrics.tas.nps,
+                            totalEvaluations: cohort.metrics.tas.count
+                        },
                         participation: {
                             average: cohort.metrics.participation.avg,
                             totalEvaluations: cohort.metrics.participation.count
@@ -1269,6 +1318,11 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                         cohort: sortedEvaluations.map(evaluation => ({
                             date: evaluation.date,
                             score: evaluation.cohortScore,
+                            evaluationId: evaluation.npsId
+                        })),
+                        tas: sortedEvaluations.map(evaluation => ({
+                            date: evaluation.date,
+                            score: evaluation.taScores,
                             evaluationId: evaluation.npsId
                         })),
                         participation: sortedEvaluations.map(evaluation => ({
@@ -1295,6 +1349,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                     name: cohort.cohortName,
                     teacherAverage: cohort.metrics.teacher.avg,
                     cohortAverage: cohort.metrics.cohort.avg,
+                    taAverage: cohort.metrics.tas.avg, // Agregar promedio de TA
                     status: cohort.status,
                     isActive: resultActive.some(c => c.cohortId === cohort.cohortId)
                 })),
@@ -1317,6 +1372,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                     status: cohort.status,
                     teacherAverage: cohort.metrics.teacher.avg,
                     cohortAverage: cohort.metrics.cohort.avg,
+                    taAverage: cohort.metrics.tas.avg, // Agregar promedio de TA
                     participation: cohort.metrics.participation.avg,
                     evaluations: cohort.totalEvaluations,
                     isActive: resultActive.some(c => c.cohortId === cohort.cohortId)
@@ -1352,13 +1408,20 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
 
             // Datos para KPIs
             kpis: {
-                overallTeacherAverage: overall.avg,
+                overallTeacherAverage: overall.avg, // Ahora puede ser TA o Teacher según el rol
                 overallCohortAverage: Array.from(byCohort.values())
                     .flatMap(x => x.items.map(i => i.cohortScore))
                     .filter(s => s > 0)
                     .reduce((a, b) => a + b, 0) /
                     Array.from(byCohort.values())
                         .flatMap(x => x.items.map(i => i.cohortScore))
+                        .filter(s => s > 0).length || 0,
+                overallTAAverage: Array.from(byCohort.values()) // Agregar promedio general de TA
+                    .flatMap(x => x.items.map(i => i.taScores))
+                    .filter(s => s > 0)
+                    .reduce((a, b) => a + b, 0) /
+                    Array.from(byCohort.values())
+                        .flatMap(x => x.items.map(i => i.taScores))
                         .filter(s => s > 0).length || 0,
                 totalEvaluations: pages.length,
                 totalCohorts: resultActive.length + resultPast.length,
@@ -1370,7 +1433,8 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                     .reduce((a, b) => a + b, 0) /
                     Array.from(byCohort.values())
                         .flatMap(x => x.items.map(i => i.participation))
-                        .filter(p => p > 0).length || 0
+                        .filter(p => p > 0).length || 0,
+                scoreType: isAssistant ? 'TA Score' : 'Teacher Score' // Añadir tipo de score
             },
 
             // Metadatos
@@ -1401,6 +1465,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             kpis: {
                 overallTeacherAverage: visualizationData.kpis?.overallTeacherAverage || 0,
                 overallCohortAverage: visualizationData.kpis?.overallCohortAverage || 0,
+                overallTAAverage: visualizationData.kpis?.overallTAAverage || 0,
                 totalEvaluations: visualizationData.kpis?.totalEvaluations || 0,
                 totalCohorts: visualizationData.kpis?.totalCohorts || 0,
                 activeCohorts: visualizationData.kpis?.activeCohorts || 0,
@@ -1424,13 +1489,15 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             activeCohorts: resultActive,
             pastCohorts: resultPast,
             overall: {
-                teacherAverage: overall.avg,
-                totalEvaluations: overall.count
+                teacherAverage: overall.avg, // Mantener nombre por compatibilidad
+                totalEvaluations: overall.count,
+                scoreType: isAssistant ? 'TA Score' : 'Teacher Score' // Añadir información del tipo
             },
             totalCohorts: resultActive.length + resultPast.length,
             totalEvaluations: pages.length,
             mentorId,
             mentorName,
+            userRole: isAssistant ? 'assistant' : 'teacher', // Añadir rol del usuario
             visualizationData: safeVisualizationData,
             totalComments: Array.from(commentsMap.values()).flat().length
         });
