@@ -978,11 +978,18 @@ async function resolveMentorIdFromReq(req: Request): Promise<string> {
 // Endpoint para obtener NPS de un mentor
 app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) => {
     try {
+
+
         const { mentorId: mentorIdFromBody, startDate, endDate, includePast = true } = req.body;
 
         let mentorId = mentorIdFromBody;
         if (!mentorId) {
-            mentorId = await resolveMentorIdFromReq(req);
+            try {
+                mentorId = await resolveMentorIdFromReq(req);
+            } catch (error) {
+                console.error('Error resolviendo mentorId:', error);
+                return res.status(400).json({ error: 'Error resolviendo mentorId', details: error.message });
+            }
         }
 
         const NPS_DB = process.env.NOTION_NPS_DATABASE_ID || '';
@@ -1055,15 +1062,20 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             });
         }
 
-        console.log('🔍 [Mentor NPS] Filtro construido:');
-        console.log('   - Rol detectado:', isAssistant ? 'Assistant' : 'Teacher');
-        console.log('   - Mentor ID:', mentorId);
-        console.log('   - Filtro:', JSON.stringify(filter, null, 2));
+
 
         // Obtener todas las páginas de NPS del mentor (incluyendo las que no le corresponden)
-        const allPages = await notionQueryAll(NPS_DB, filter);
-
-        console.log(`🔍 [Mentor NPS] Total evaluaciones encontradas: ${allPages.length}`);
+        let allPages: any[];
+        try {
+            allPages = await notionQueryAll(NPS_DB, filter);
+        } catch (error) {
+            console.error('Error consultando Notion:', error);
+            return res.status(500).json({
+                error: 'Error consultando Notion',
+                details: error.message,
+                databaseId: NPS_DB
+            });
+        }
 
         // Filtrar evaluaciones que realmente corresponden al mentor actual
         const pages: any[] = [];
@@ -1072,37 +1084,54 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         for (const page of allPages) {
             const props = (page as any).properties || {};
 
-            // Extraer datos de cambio de mentor
-            const teacherRelation = props['Teacher']?.relation || props['Teacher']?.rollup?.array?.[0]?.relation || [];
-            const teacherIds = teacherRelation.map((t: any) => t.id);
-            const mentorChangeDate = props['Mentor Change Date']?.rollup?.array?.[0]?.date?.start || null;
+            // Para assistants, no aplicar lógica de cambio de mentor (pueden haber múltiples TAs)
+            if (isAssistant) {
+                // Verificar que el TA actual esté en la lista de TAs de la evaluación
+                const taRelation = props['T.A.']?.relation || props['T.A.']?.rollup?.array?.[0]?.relation || [];
+                const taIds = taRelation.map((t: any) => t.id);
 
-            // Extraer fecha de evaluación
-            const evaluationDate = props['Date of Creation']?.date?.start ||
-                props['Date of Creation']?.rich_text?.[0]?.plain_text ||
-                page.created_time ||
-                props['NPS ID']?.title?.[0]?.plain_text || '';
-
-            // Determinar si el mentor actual es responsable de esta evaluación
-            const responsibility = isMentorResponsibleForEvaluation(
-                evaluationDate,
-                mentorChangeDate,
-                teacherIds,
-                mentorId
-            );
-
-            if (responsibility.isResponsible) {
-                pages.push(page);
-                console.log(`✅ [Mentor NPS] Evaluación ${props['NPS ID']?.title?.[0]?.plain_text || 'sin ID'} asignada al mentor: ${responsibility.reason}`);
+                if (taIds.includes(mentorId)) {
+                    pages.push(page);
+                } else {
+                    skippedEvaluations.push({
+                        npsId: props['NPS ID']?.title?.[0]?.plain_text || 'sin ID',
+                        reason: 'TA no presente en la evaluación',
+                        evaluationDate: props['Date of Creation']?.date?.start || page.created_time,
+                        mentorChangeDate: null,
+                        teacherIds: taIds
+                    });
+                }
             } else {
-                skippedEvaluations.push({
-                    npsId: props['NPS ID']?.title?.[0]?.plain_text || 'sin ID',
-                    reason: responsibility.reason,
+                // Para teachers, aplicar lógica de cambio de mentor (1 mentor por cohorte)
+                const teacherRelation = props['Teacher']?.relation || props['Teacher']?.rollup?.array?.[0]?.relation || [];
+                const teacherIds = teacherRelation.map((t: any) => t.id);
+                const mentorChangeDate = props['Mentor Change Date']?.rollup?.array?.[0]?.date?.start || null;
+
+                // Extraer fecha de evaluación
+                const evaluationDate = props['Date of Creation']?.date?.start ||
+                    props['Date of Creation']?.rich_text?.[0]?.plain_text ||
+                    page.created_time ||
+                    props['NPS ID']?.title?.[0]?.plain_text || '';
+
+                // Determinar si el mentor actual es responsable de esta evaluación
+                const responsibility = isMentorResponsibleForEvaluation(
                     evaluationDate,
                     mentorChangeDate,
-                    teacherIds
-                });
-                console.log(`⏭️ [Mentor NPS] Saltando evaluación ${props['NPS ID']?.title?.[0]?.plain_text || 'sin ID'}: ${responsibility.reason}`);
+                    teacherIds,
+                    mentorId
+                );
+
+                if (responsibility.isResponsible) {
+                    pages.push(page);
+                } else {
+                    skippedEvaluations.push({
+                        npsId: props['NPS ID']?.title?.[0]?.plain_text || 'sin ID',
+                        reason: responsibility.reason,
+                        evaluationDate,
+                        mentorChangeDate,
+                        teacherIds
+                    });
+                }
             }
         }
 
@@ -1141,21 +1170,16 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                                     }
                                 };
                                 commentsMap.set(npsId, [enrichedComment]);
-
-                                // Log del contenido del comentario extraído
-                                console.log(`📝 [NPS ${npsId}] Comentario: "${firstCommentText.substring(0, 100)}..."`);
                             } else {
                                 commentsMap.set(npsId, [firstComment]);
                             }
                         } catch (error) {
-                            console.error('Error obteniendo información del autor:', error);
                             commentsMap.set(npsId, [firstComment]);
                         }
                     } else {
                         commentsMap.set(npsId, []);
                     }
                 } catch (error) {
-                    console.error(`Error obteniendo comentarios para ${npsId}:`, error);
                     commentsMap.set(npsId, []);
                 }
             }
@@ -1216,20 +1240,22 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                 page.created_time ||
                 npsId;
 
-            // Validar datos de cambio de mentor
-            const validation = validateMentorChangeData(teacherIds, mentorChangeDate, evaluationDate);
-            if (!validation.isValid) {
-                validationStats.warnings.push(`Evaluación ${npsId}: ${validation.reason}`);
-                console.warn(`⚠️ [Mentor NPS] ${validation.reason} en evaluación ${npsId}`);
-            }
+            // Para assistants, no aplicar validaciones de cambio de mentor
+            if (!isAssistant) {
+                // Validar datos de cambio de mentor (solo para teachers)
+                const validation = validateMentorChangeData(teacherIds, mentorChangeDate, evaluationDate);
+                if (!validation.isValid) {
+                    validationStats.warnings.push(`Evaluación ${npsId}: ${validation.reason}`);
+                }
 
-            // Actualizar estadísticas de cambio de mentor
-            if (teacherIds.length === 2) {
-                validationStats.mentorChanges.total++;
-                if (mentorChangeDate) {
-                    validationStats.mentorChanges.withChangeDate++;
-                } else {
-                    validationStats.mentorChanges.withoutChangeDate++;
+                // Actualizar estadísticas de cambio de mentor
+                if (teacherIds.length === 2) {
+                    validationStats.mentorChanges.total++;
+                    if (mentorChangeDate) {
+                        validationStats.mentorChanges.withChangeDate++;
+                    } else {
+                        validationStats.mentorChanges.withoutChangeDate++;
+                    }
                 }
             }
 
@@ -1281,7 +1307,6 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                             'TA sin nombre';
                         return { id: taId, name: taName };
                     } catch (error) {
-                        console.error(`Error obteniendo TA ${ta.id || ta.relation?.id}:`, error);
                         return { id: ta.id || ta.relation?.id || 'unknown', name: 'TA no encontrado' };
                     }
                 })
@@ -1319,7 +1344,6 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                     const page = await notion.pages.retrieve({ page_id: id });
                     return page;
                 } catch (error) {
-                    console.error(`Error obteniendo cohorte ${id}:`, error);
                     return null;
                 }
             })
@@ -1426,7 +1450,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                 (mentorPage as any).properties?.Title?.title?.[0]?.plain_text ||
                 'Mentor';
         } catch (error) {
-            console.error('Error obteniendo nombre del mentor:', error);
+            // Silently handle error getting mentor name
         }
 
         // Organizar datos para visualización por cohorte
@@ -1836,7 +1860,20 @@ function isISODateString(dateStr: string) {
     return typeof dateStr === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(dateStr);
 }
 
-
+// Endpoint de prueba para verificar que el servidor funciona
+app.get('/api/health', (req, res) => {
+    res.status(200).json({
+        status: 'OK',
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV || 'development',
+        variables: {
+            notionToken: process.env.NOTION_TOKEN ? '✅ Configurado' : '❌ Faltante',
+            npsDatabase: process.env.NOTION_NPS_DATABASE_ID ? '✅ Configurado' : '❌ Faltante',
+            mentorsDatabase: process.env.NOTION_MENTORS_DATABASE_ID ? '✅ Configurado' : '❌ Faltante',
+            breathcodeUrl: process.env.BREATHCODE_API_URL ? '✅ Configurado' : '❌ Faltante'
+        }
+    });
+});
 
 app.listen(5000, () => console.log('Server ready on port 5000.'));
 
