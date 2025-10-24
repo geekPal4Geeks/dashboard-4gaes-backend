@@ -961,35 +961,155 @@ function isMentorResponsibleForEvaluation(
 
 async function resolveMentorIdFromReq(req: Request): Promise<string> {
     const email = (req as any).user4GeeksData?.email;
-    if (!email) throw new Error('No se encontró email en el token');
+    if (!email) {
+        console.error('❌ [resolveMentorIdFromReq] No se encontró email en el token');
+        throw new Error('No se encontró email en el token');
+    }
 
     const MENTORS_DB = process.env.NOTION_MENTORS_DATABASE_ID || '';
-    if (!MENTORS_DB) throw new Error('Falta NOTION_MENTORS_DATABASE_ID');
+    if (!MENTORS_DB) {
+        console.error('❌ [resolveMentorIdFromReq] Falta NOTION_MENTORS_DATABASE_ID en variables de entorno');
+        throw new Error('Falta NOTION_MENTORS_DATABASE_ID');
+    }
 
-    const result = await notion.databases.query({
-        database_id: MENTORS_DB,
-        filter: { property: 'Correo', email: { equals: email } }
-    });
+    console.log('🔍 [resolveMentorIdFromReq] Buscando mentor con email:', email);
+    console.log('🔍 [resolveMentorIdFromReq] Usando base de datos:', MENTORS_DB);
 
-    if (!result.results?.length) throw new Error('Mentor no encontrado');
-    return result.results[0].id; // <- Este es el mismo id que ves en /api/mentors/me
+    try {
+        const result = await notion.databases.query({
+            database_id: MENTORS_DB,
+            filter: { property: 'Correo', email: { equals: email } }
+        });
+
+        console.log('📊 [resolveMentorIdFromReq] Resultado de la consulta:', {
+            totalResults: result.results?.length || 0,
+            hasResults: !!result.results?.length,
+            email: email
+        });
+
+        if (!result.results?.length) {
+            console.error('❌ [resolveMentorIdFromReq] Mentor no encontrado para email:', email);
+            console.error('❌ [resolveMentorIdFromReq] Posibles causas:');
+            console.error('   - El email no existe en la base de datos de mentores');
+            console.error('   - El nombre de la propiedad "Correo" es incorrecto');
+            console.error('   - El formato del email no coincide exactamente');
+            console.error('   - El mentor no está registrado en Notion');
+            throw new Error(`Mentor no encontrado para el email: ${email}`);
+        }
+
+        const mentorId = result.results[0].id;
+        console.log('✅ [resolveMentorIdFromReq] Mentor encontrado:', {
+            mentorId,
+            email,
+            mentorName: (result.results[0] as any).properties?.Name?.title?.[0]?.plain_text || 'Sin nombre'
+        });
+
+        return mentorId;
+    } catch (error: any) {
+        console.error('❌ [resolveMentorIdFromReq] Error en la consulta a Notion:', {
+            error: error.message,
+            email,
+            databaseId: MENTORS_DB,
+            errorCode: error.code,
+            errorType: error.type
+        });
+        
+        // Re-lanzar el error con más contexto
+        throw new Error(`Error consultando mentor en Notion: ${error.message}`);
+    }
 }
 
 // Endpoint para obtener NPS de un mentor
 app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) => {
     try {
-
+        console.log('🔍 [mentor-nps] Iniciando consulta NPS');
+        console.log('🔍 [mentor-nps] Datos del usuario:', {
+            email: (req as any).user4GeeksData?.email,
+            roles: (req as any).user4GeeksData?.roles || []
+        });
 
         const { mentorId: mentorIdFromBody, startDate, endDate, includePast = true } = req.body;
 
-        let mentorId = mentorIdFromBody;
+        let mentorId: string | undefined = undefined;
+        
+        // Procesar mentorIdFromBody si existe
+        if (mentorIdFromBody !== undefined && mentorIdFromBody !== null) {
+            // Convertir a string y validar formato básico
+            if (typeof mentorIdFromBody === 'string') {
+                mentorId = mentorIdFromBody.trim();
+                console.log('✅ [mentor-nps] MentorId recibido del body:', mentorId);
+            } else if (typeof mentorIdFromBody === 'number') {
+                mentorId = mentorIdFromBody.toString();
+                console.log('⚠️ [mentor-nps] MentorId convertido de número a string:', mentorId);
+            } else {
+                console.error('❌ [mentor-nps] Tipo de mentorId inválido:', {
+                    type: typeof mentorIdFromBody,
+                    value: mentorIdFromBody
+                });
+                return res.status(400).json({ 
+                    error: 'Tipo de mentorId inválido',
+                    details: 'El mentorId debe ser un string o número',
+                    received: {
+                        type: typeof mentorIdFromBody,
+                        value: mentorIdFromBody
+                    }
+                });
+            }
+        }
+        
+        // Si no se proporciona mentorId en el body, intentar resolverlo desde el token
         if (!mentorId) {
+            console.log('🔍 [mentor-nps] No se proporcionó mentorId en el body, resolviendo desde token...');
             try {
                 mentorId = await resolveMentorIdFromReq(req);
-            } catch (error) {
-                console.error('Error resolviendo mentorId:', error);
-                return res.status(400).json({ error: 'Error resolviendo mentorId', details: error.message });
+                console.log('✅ [mentor-nps] MentorId resuelto exitosamente:', mentorId);
+            } catch (error: any) {
+                console.error('❌ [mentor-nps] Error resolviendo mentorId:', {
+                    error: error.message,
+                    email: (req as any).user4GeeksData?.email,
+                    stack: error.stack
+                });
+                return res.status(400).json({ 
+                    error: 'Error resolviendo mentorId', 
+                    details: error.message,
+                    troubleshooting: {
+                        checkEmail: 'Verifica que el email del usuario esté registrado en la base de datos de mentores',
+                        checkNotion: 'Verifica que el mentor esté registrado en Notion con el email correcto',
+                        checkProperty: 'Verifica que la propiedad se llame "Correo" en la base de datos de mentores',
+                        useDebugEndpoint: 'Usa POST /api/mentors/debug para obtener más información'
+                    }
+                });
             }
+        } else {
+            console.log('✅ [mentor-nps] Usando mentorId proporcionado en el body:', mentorId);
+        }
+
+        // Validar que mentorId tenga el formato correcto (UUID de Notion)
+        if (!mentorId) {
+            console.error('❌ [mentor-nps] MentorId faltante');
+            return res.status(400).json({ 
+                error: 'MentorId faltante',
+                details: 'No se pudo obtener el mentorId ni del body ni del token'
+            });
+        }
+
+        // Validar formato UUID de Notion (32 caracteres alfanuméricos)
+        const uuidRegex = /^[a-f0-9]{32}$/i;
+        if (!uuidRegex.test(mentorId)) {
+            console.error('❌ [mentor-nps] MentorId con formato inválido:', {
+                mentorId,
+                length: mentorId.length,
+                isValidFormat: uuidRegex.test(mentorId)
+            });
+            return res.status(400).json({ 
+                error: 'Formato de MentorId inválido',
+                details: 'El mentorId debe ser un UUID válido de Notion (32 caracteres alfanuméricos)',
+                received: {
+                    value: mentorId,
+                    length: mentorId.length,
+                    expectedFormat: '32 caracteres alfanuméricos (ej: 1234567890abcdef1234567890abcdef)'
+                }
+            });
         }
 
         const NPS_DB = process.env.NOTION_NPS_DATABASE_ID || '';
@@ -1820,20 +1940,287 @@ app.put('/api/mentor-nps/evaluation-seen', authorizeTeachersOrAssistants(), asyn
 
 
 
+// Endpoint para demostrar el problema de tipos con mentorId
+app.post('/api/mentors/type-demo', authorizeTeachersOrAssistants(), async (req, res) => {
+    try {
+        const { mentorId: mentorIdFromBody } = req.body;
+
+        // ❌ PROBLEMA: Asignación directa sin validación de tipos
+        let mentorIdProblematic = mentorIdFromBody;
+        
+        // ✅ SOLUCIÓN: Procesamiento seguro de tipos
+        let mentorIdSafe: string | undefined = undefined;
+        
+        if (mentorIdFromBody !== undefined && mentorIdFromBody !== null) {
+            if (typeof mentorIdFromBody === 'string') {
+                mentorIdSafe = mentorIdFromBody.trim();
+            } else if (typeof mentorIdFromBody === 'number') {
+                mentorIdSafe = mentorIdFromBody.toString();
+            }
+        }
+
+        const demo = {
+            input: {
+                value: mentorIdFromBody,
+                type: typeof mentorIdFromBody,
+                isString: typeof mentorIdFromBody === 'string',
+                isNumber: typeof mentorIdFromBody === 'number',
+                isBoolean: typeof mentorIdFromBody === 'boolean',
+                isObject: typeof mentorIdFromBody === 'object',
+                isNull: mentorIdFromBody === null,
+                isUndefined: mentorIdFromBody === undefined
+            },
+            problematicAssignment: {
+                value: mentorIdProblematic,
+                type: typeof mentorIdProblematic,
+                canBeAssignedToString: typeof mentorIdProblematic === 'string',
+                problems: []
+            },
+            safeProcessing: {
+                value: mentorIdSafe,
+                type: typeof mentorIdSafe,
+                isValidString: typeof mentorIdSafe === 'string',
+                isReadyForNotion: mentorIdSafe && typeof mentorIdSafe === 'string' && /^[a-f0-9]{32}$/i.test(mentorIdSafe)
+            }
+        };
+
+        // Identificar problemas potenciales
+        if (typeof mentorIdProblematic !== 'string') {
+            demo.problematicAssignment.problems.push(`Tipo incorrecto: ${typeof mentorIdProblematic}`);
+        }
+        if (mentorIdProblematic && typeof mentorIdProblematic === 'string' && !/^[a-f0-9]{32}$/i.test(mentorIdProblematic)) {
+            demo.problematicAssignment.problems.push('Formato UUID inválido');
+        }
+
+        res.status(200).json({
+            message: 'Demostración del problema de tipos con mentorId',
+            explanation: {
+                problem: 'let mentorId = mentorIdFromBody puede asignar cualquier tipo',
+                solution: 'Procesar mentorIdFromBody de forma segura antes de asignar',
+                types: {
+                    mentorIdFromBody: 'any (puede ser cualquier tipo)',
+                    mentorIdSafe: 'string | undefined (tipo seguro)'
+                }
+            },
+            demo,
+            recommendations: [
+                'Siempre valida el tipo antes de asignar',
+                'Convierte tipos compatibles (number -> string)',
+                'Rechaza tipos incompatibles (boolean, object, etc.)',
+                'Usa TypeScript para detectar estos problemas en tiempo de compilación'
+            ]
+        });
+
+    } catch (err: any) {
+        console.error('❌ [type-demo] Error:', err);
+        res.status(500).json({ 
+            error: 'Error en demostración de tipos',
+            details: err.message
+        });
+    }
+});
+
+// Endpoint para obtener información detallada sobre el mentorId
+app.get('/api/mentors/mentor-id-info', authorizeTeachersOrAssistants(), async (req, res) => {
+    try {
+        const email = (req as any).user4GeeksData?.email;
+        if (!email) {
+            return res.status(400).json({ error: 'No se encontró email en el token' });
+        }
+
+        console.log('🔍 [mentor-id-info] Obteniendo información del mentorId para:', email);
+
+        // Intentar resolver el mentorId
+        let mentorId: string;
+        let mentorInfo: any = null;
+        let error: any = null;
+
+        try {
+            mentorId = await resolveMentorIdFromReq(req);
+            
+            // Obtener información adicional del mentor
+            const mentorPage = await notion.pages.retrieve({ page_id: mentorId });
+            mentorInfo = {
+                id: mentorPage.id,
+                name: (mentorPage as any).properties?.Name?.title?.[0]?.plain_text || 'Sin nombre',
+                email: (mentorPage as any).properties?.Correo?.email || 'Sin email',
+                createdTime: (mentorPage as any).created_time,
+                lastEditedTime: (mentorPage as any).last_edited_time
+            };
+        } catch (err: any) {
+            error = {
+                message: err.message,
+                code: err.code,
+                type: err.type
+            };
+        }
+
+        const response = {
+            userEmail: email,
+            mentorId: mentorId || null,
+            mentorInfo,
+            error,
+            mentorIdFormat: {
+                expected: 'UUID de Notion (32 caracteres)',
+                example: '1234567890abcdef1234567890abcdef',
+                description: 'El mentorId es el ID único de la página del mentor en Notion'
+            },
+            howToUse: {
+                inRequestBody: 'Puedes enviar mentorId en el body de la request',
+                autoResolve: 'Si no envías mentorId, se resuelve automáticamente desde el token',
+                validation: 'El mentorId debe ser un string de 32 caracteres'
+            },
+            troubleshooting: error ? [
+                'El mentor no está registrado en la base de datos de Notion',
+                'Verifica que el email coincida exactamente',
+                'Verifica que la propiedad se llame "Correo" en Notion',
+                'Usa POST /api/mentors/debug para más detalles'
+            ] : [
+                'MentorId válido encontrado',
+                'Puedes usar este mentorId en las requests'
+            ]
+        };
+
+        console.log('✅ [mentor-id-info] Información obtenida:', response);
+
+        res.status(200).json(response);
+    } catch (err: any) {
+        console.error('❌ [mentor-id-info] Error:', err);
+        res.status(500).json({ 
+            error: 'Error obteniendo información del mentorId',
+            details: err.message
+        });
+    }
+});
+
+// Endpoint para diagnosticar problemas con mentores
+app.post('/api/mentors/debug', authorizeTeachersOrAssistants(), async (req, res) => {
+    try {
+        const email = (req as any).user4GeeksData?.email;
+        if (!email) {
+            return res.status(400).json({ error: 'No se encontró email en el token' });
+        }
+
+        const MENTORS_DB = process.env.NOTION_MENTORS_DATABASE_ID || '';
+        if (!MENTORS_DB) {
+            return res.status(500).json({ error: 'Falta NOTION_MENTORS_DATABASE_ID' });
+        }
+
+        console.log('🔍 [mentors/debug] Iniciando diagnóstico para email:', email);
+
+        // Información del usuario autenticado
+        const userInfo = {
+            email: email,
+            firstName: (req as any).user4GeeksData?.first_name,
+            lastName: (req as any).user4GeeksData?.last_name,
+            username: (req as any).user4GeeksData?.username,
+            roles: (req as any).user4GeeksData?.roles || []
+        };
+
+        // Intentar buscar el mentor
+        let mentorResult = null;
+        let mentorError = null;
+        
+        try {
+            mentorResult = await notion.databases.query({
+                database_id: MENTORS_DB,
+                filter: { property: 'Correo', email: { equals: email } }
+            });
+        } catch (error: any) {
+            mentorError = {
+                message: error.message,
+                code: error.code,
+                type: error.type
+            };
+        }
+
+        // Información de diagnóstico
+        const diagnosis = {
+            userInfo,
+            databaseInfo: {
+                mentorsDatabaseId: MENTORS_DB,
+                databaseConfigured: !!MENTORS_DB
+            },
+            searchResult: {
+                found: mentorResult ? !!mentorResult.results?.length : false,
+                totalResults: mentorResult?.results?.length || 0,
+                error: mentorError
+            },
+            mentorInfo: mentorResult?.results?.length ? {
+                id: mentorResult.results[0].id,
+                name: (mentorResult.results[0] as any).properties?.Name?.title?.[0]?.plain_text || 'Sin nombre',
+                email: (mentorResult.results[0] as any).properties?.Correo?.email || 'Sin email'
+            } : null,
+            recommendations: []
+        };
+
+        // Generar recomendaciones
+        if (!mentorResult?.results?.length) {
+            diagnosis.recommendations.push('El mentor no está registrado en la base de datos de Notion');
+            diagnosis.recommendations.push('Verifica que el email coincida exactamente con el registrado en Notion');
+            diagnosis.recommendations.push('Verifica que la propiedad se llame "Correo" en la base de datos');
+        }
+
+        if (mentorError) {
+            diagnosis.recommendations.push('Error en la consulta a Notion - verifica la configuración de la base de datos');
+        }
+
+        console.log('📊 [mentors/debug] Diagnóstico completado:', diagnosis);
+
+        res.status(200).json(diagnosis);
+    } catch (err: any) {
+        console.error('❌ [mentors/debug] Error en diagnóstico:', err);
+        res.status(500).json({ 
+            error: 'Error en diagnóstico de mentor',
+            details: err.message
+        });
+    }
+});
+
 app.get('/api/mentors/me', authorizeTeachersOrAssistants(), async (req, res) => {
     try {
         const email = (req as any).user4GeeksData?.email;
-        if (!email) return res.status(400).json({ error: 'No se encontró email en el token' });
+        if (!email) {
+            console.error('❌ [mentors/me] No se encontró email en el token');
+            return res.status(400).json({ error: 'No se encontró email en el token' });
+        }
 
         const MENTORS_DB = process.env.NOTION_MENTORS_DATABASE_ID || '';
-        if (!MENTORS_DB) return res.status(500).json({ error: 'Falta NOTION_MENTORS_DATABASE_ID' });
+        if (!MENTORS_DB) {
+            console.error('❌ [mentors/me] Falta NOTION_MENTORS_DATABASE_ID en variables de entorno');
+            return res.status(500).json({ error: 'Falta NOTION_MENTORS_DATABASE_ID' });
+        }
+
+        console.log('🔍 [mentors/me] Buscando mentor con email:', email);
 
         const result = await notion.databases.query({
             database_id: MENTORS_DB,
             filter: { property: 'Correo', email: { equals: email } }
         });
 
-        if (!result.results?.length) return res.status(404).json({ error: 'Mentor no encontrado' });
+        console.log('📊 [mentors/me] Resultado de la consulta:', {
+            totalResults: result.results?.length || 0,
+            hasResults: !!result.results?.length,
+            email: email
+        });
+
+        if (!result.results?.length) {
+            console.error('❌ [mentors/me] Mentor no encontrado para email:', email);
+            console.error('❌ [mentors/me] Posibles causas:');
+            console.error('   - El email no existe en la base de datos de mentores');
+            console.error('   - El nombre de la propiedad "Correo" es incorrecto');
+            console.error('   - El formato del email no coincide exactamente');
+            console.error('   - El mentor no está registrado en Notion');
+            return res.status(404).json({ 
+                error: 'Mentor no encontrado',
+                details: `No se encontró un mentor registrado con el email: ${email}`,
+                troubleshooting: {
+                    checkEmail: 'Verifica que el email sea correcto',
+                    checkNotion: 'Verifica que el mentor esté registrado en la base de datos de Notion',
+                    checkProperty: 'Verifica que la propiedad se llame "Correo" en Notion'
+                }
+            });
+        }
 
         const page = result.results[0] as any;
         const name =
@@ -1844,14 +2231,28 @@ app.get('/api/mentors/me', authorizeTeachersOrAssistants(), async (req, res) => 
                 .join(' ') ||
             (req as any).user4GeeksData?.username;
 
+        console.log('✅ [mentors/me] Mentor encontrado:', {
+            mentorId: page.id,
+            name: name?.trim() || null,
+            email
+        });
+
         res.status(200).json({
             id: page.id,
             name: name?.trim() || null,
             email
         });
-    } catch (err) {
-        console.error('Error consultando mentor:', err);
-        res.status(500).json({ error: 'Error al consultar mentor' });
+    } catch (err: any) {
+        console.error('❌ [mentors/me] Error consultando mentor:', {
+            error: err.message,
+            errorCode: err.code,
+            errorType: err.type,
+            email: (req as any).user4GeeksData?.email
+        });
+        res.status(500).json({ 
+            error: 'Error al consultar mentor',
+            details: err.message
+        });
     }
 });
 
