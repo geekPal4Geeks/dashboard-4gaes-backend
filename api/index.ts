@@ -1093,24 +1093,41 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             });
         }
 
-        // Validar formato UUID de Notion (32 caracteres alfanuméricos)
-        const uuidRegex = /^[a-f0-9]{32}$/i;
-        if (!uuidRegex.test(mentorId)) {
+        // Validar formato UUID de Notion (acepta tanto formato con guiones como sin guiones)
+        const uuidWithDashesRegex = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+        const uuidWithoutDashesRegex = /^[a-f0-9]{32}$/i;
+        
+        if (!uuidWithDashesRegex.test(mentorId) && !uuidWithoutDashesRegex.test(mentorId)) {
             console.error('❌ [mentor-nps] MentorId con formato inválido:', {
                 mentorId,
                 length: mentorId.length,
-                isValidFormat: uuidRegex.test(mentorId)
+                isValidWithDashes: uuidWithDashesRegex.test(mentorId),
+                isValidWithoutDashes: uuidWithoutDashesRegex.test(mentorId)
             });
             return res.status(400).json({ 
                 error: 'Formato de MentorId inválido',
-                details: 'El mentorId debe ser un UUID válido de Notion (32 caracteres alfanuméricos)',
+                details: 'El mentorId debe ser un UUID válido de Notion',
                 received: {
                     value: mentorId,
                     length: mentorId.length,
-                    expectedFormat: '32 caracteres alfanuméricos (ej: 1234567890abcdef1234567890abcdef)'
+                    expectedFormats: [
+                        'Con guiones: 230463fd-128a-4188-82d3-ca5445bc19c4 (36 caracteres)',
+                        'Sin guiones: 230463fd128a418882d3ca5445bc19c4 (32 caracteres)'
+                    ]
                 }
             });
         }
+
+        // Normalizar UUID removiendo guiones para consistencia
+        const normalizedMentorId = mentorId.replace(/-/g, '');
+        console.log('✅ [mentor-nps] MentorId normalizado:', {
+            original: mentorId,
+            normalized: normalizedMentorId,
+            length: normalizedMentorId.length
+        });
+        
+        // Usar el mentorId normalizado para el resto del código
+        mentorId = normalizedMentorId;
 
         const NPS_DB = process.env.NOTION_NPS_DATABASE_ID || '';
         if (!NPS_DB) {
@@ -1980,7 +1997,11 @@ app.post('/api/mentors/type-demo', authorizeTeachersOrAssistants(), async (req, 
                 value: mentorIdSafe,
                 type: typeof mentorIdSafe,
                 isValidString: typeof mentorIdSafe === 'string',
-                isReadyForNotion: mentorIdSafe && typeof mentorIdSafe === 'string' && /^[a-f0-9]{32}$/i.test(mentorIdSafe)
+                isValidUUIDWithDashes: mentorIdSafe && typeof mentorIdSafe === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(mentorIdSafe),
+                isValidUUIDWithoutDashes: mentorIdSafe && typeof mentorIdSafe === 'string' && /^[a-f0-9]{32}$/i.test(mentorIdSafe),
+                isReadyForNotion: mentorIdSafe && typeof mentorIdSafe === 'string' && 
+                    (/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(mentorIdSafe) || 
+                     /^[a-f0-9]{32}$/i.test(mentorIdSafe))
             }
         };
 
@@ -1988,8 +2009,10 @@ app.post('/api/mentors/type-demo', authorizeTeachersOrAssistants(), async (req, 
         if (typeof mentorIdProblematic !== 'string') {
             demo.problematicAssignment.problems.push(`Tipo incorrecto: ${typeof mentorIdProblematic}`);
         }
-        if (mentorIdProblematic && typeof mentorIdProblematic === 'string' && !/^[a-f0-9]{32}$/i.test(mentorIdProblematic)) {
-            demo.problematicAssignment.problems.push('Formato UUID inválido');
+        if (mentorIdProblematic && typeof mentorIdProblematic === 'string' && 
+            !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(mentorIdProblematic) && 
+            !/^[a-f0-9]{32}$/i.test(mentorIdProblematic)) {
+            demo.problematicAssignment.problems.push('Formato UUID inválido (debe ser con o sin guiones)');
         }
 
         res.status(200).json({
