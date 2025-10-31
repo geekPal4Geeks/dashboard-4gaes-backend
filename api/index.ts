@@ -1713,29 +1713,27 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         let allPages: any[] = [];
         // Guardar las cohortes encontradas en la búsqueda inicial para usar después
         let allMentorCohortIdsFromSearch = new Set<string>();
+        // Guardar las páginas de cohortes para evitar consultas posteriores
+        let allMentorCohortPagesCache = new Map<string, any>();
         
         try {
             // Paso 1: Buscar todas las cohortes asignadas al mentor (T.A. y Teacher, directas y rollup)
+            // OPTIMIZACIÓN: Paralelizar las 4 consultas para reducir tiempo de respuesta
             const allMentorCohortIds = new Set<string>();
+            const allMentorCohortPages = new Map<string, any>();
             
             try {
-                // Buscar cohortes con T.A. directo
-                try {
-                    const taDirectQuery = await notion.databases.query({
+                // Ejecutar las 4 consultas en paralelo para reducir latencia
+                const [taDirectResult, taRollupResult, teacherDirectResult, teacherRollupResult] = await Promise.allSettled([
+                    notion.databases.query({
                         database_id: COHORTS_DB_FOR_EVALS_SEARCH,
                         filter: {
                             property: 'T.A.',
                             relation: { contains: originalMentorId }
-                        }
-                    });
-                    taDirectQuery.results?.forEach((page: any) => allMentorCohortIds.add(page.id));
-                } catch (error: any) {
-                    // Ignorar errores de tipo de propiedad
-                }
-
-                // Buscar cohortes con T.A. rollup
-                try {
-                    const taRollupQuery = await notion.databases.query({
+                        },
+                        page_size: 100
+                    }).catch(() => ({ results: [] })),
+                    notion.databases.query({
                         database_id: COHORTS_DB_FOR_EVALS_SEARCH,
                         filter: {
                             property: 'T.A.',
@@ -1744,30 +1742,18 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                                     relation: { contains: originalMentorId }
                                 }
                             }
-                        }
-                    });
-                    taRollupQuery.results?.forEach((page: any) => allMentorCohortIds.add(page.id));
-                } catch (error: any) {
-                    // Ignorar errores de tipo de propiedad
-                }
-
-                // Buscar cohortes con Teacher directo
-                try {
-                    const teacherDirectQuery = await notion.databases.query({
+                        },
+                        page_size: 100
+                    }).catch(() => ({ results: [] })),
+                    notion.databases.query({
                         database_id: COHORTS_DB_FOR_EVALS_SEARCH,
                         filter: {
                             property: 'Teacher',
                             relation: { contains: originalMentorId }
-                        }
-                    });
-                    teacherDirectQuery.results?.forEach((page: any) => allMentorCohortIds.add(page.id));
-                } catch (error: any) {
-                    // Ignorar errores de tipo de propiedad
-                }
-
-                // Buscar cohortes con Teacher rollup
-                try {
-                    const teacherRollupQuery = await notion.databases.query({
+                        },
+                        page_size: 100
+                    }).catch(() => ({ results: [] })),
+                    notion.databases.query({
                         database_id: COHORTS_DB_FOR_EVALS_SEARCH,
                         filter: {
                             property: 'Teacher',
@@ -1776,15 +1762,26 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                                     relation: { contains: originalMentorId }
                                 }
                             }
-                        }
-                    });
-                    teacherRollupQuery.results?.forEach((page: any) => allMentorCohortIds.add(page.id));
-                } catch (error: any) {
-                    // Ignorar errores de tipo de propiedad
-                }
-                
-                // Guardar las cohortes encontradas para uso posterior
-                allMentorCohortIds.forEach(id => allMentorCohortIdsFromSearch.add(id));
+                        },
+                        page_size: 100
+                    }).catch(() => ({ results: [] }))
+                ]);
+
+                // Procesar resultados de todas las consultas
+                const allResults = [
+                    taDirectResult.status === 'fulfilled' ? taDirectResult.value.results || [] : [],
+                    taRollupResult.status === 'fulfilled' ? taRollupResult.value.results || [] : [],
+                    teacherDirectResult.status === 'fulfilled' ? teacherDirectResult.value.results || [] : [],
+                    teacherRollupResult.status === 'fulfilled' ? teacherRollupResult.value.results || [] : []
+                ].flat();
+
+                // Guardar IDs y páginas para evitar consultas posteriores
+                allResults.forEach((page: any) => {
+                    allMentorCohortIds.add(page.id);
+                    allMentorCohortIdsFromSearch.add(page.id);
+                    allMentorCohortPages.set(page.id, page);
+                    allMentorCohortPagesCache.set(page.id, page);
+                });
             } catch (error: any) {
                 // Continuar con el método tradicional si falla la búsqueda directa
             }
@@ -2226,114 +2223,34 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         // Agregar cohortes de la búsqueda inicial (si existen)
         allMentorCohortIdsFromSearch.forEach(id => allKnownMentorCohortIds.add(id));
         
+        // OPTIMIZACIÓN: Usar las cohortes ya encontradas en lugar de consultarlas de nuevo
+        // Solo buscar información adicional si hay cohortes que no están en el cache
         if (COHORTS_DB_FOR_INFO) {
             try {
-                // Hacer búsquedas separadas para relación directa y rollup, luego combinar
-                // IMPORTANTE: Buscar tanto en T.A. como en Teacher, ya que un mentor puede ser
-                // T.A. en unas cohortes y Teacher en otras
-                let mentorCohortIds = new Set<string>();
+                // Obtener IDs de cohortes del cache y de evaluaciones
+                const cachedCohortIds = Array.from(allMentorCohortPagesCache.keys());
+                const missingCohortIds = Array.from(allKnownMentorCohortIds).filter(id => !allMentorCohortPagesCache.has(id));
                 
-                // Buscar en T.A. (tanto relación directa como rollup)
-                try {
-                    const taDirectQuery = await notion.databases.query({
-                        database_id: COHORTS_DB_FOR_INFO,
-                        filter: {
-                            property: 'T.A.',
-                            relation: {
-                                contains: originalMentorId
-                            }
-                        },
-                        page_size: 100
-                    });
-                    taDirectQuery.results?.forEach((page: any) => mentorCohortIds.add(page.id));
-                } catch (error: any) {
-                    // Ignorar errores
+                // Si hay cohortes en el cache, usarlas directamente
+                if (cachedCohortIds.length > 0) {
+                    cachedCohortIds.forEach(id => allKnownMentorCohortIds.add(id));
                 }
                 
-                try {
-                    const taRollupQuery = await notion.databases.query({
-                        database_id: COHORTS_DB_FOR_INFO,
-                        filter: {
-                            property: 'T.A.',
-                            rollup: {
-                                any: {
-                                    relation: {
-                                        contains: originalMentorId
-                                    }
-                                }
+                // Solo buscar información adicional para cohortes que no están en el cache
+                if (missingCohortIds.length > 0) {
+                    // Obtener información de las cohortes faltantes en paralelo
+                    const missingCohortPages = await Promise.all(
+                        missingCohortIds.map(async (id) => {
+                            try {
+                                const page = await notion.pages.retrieve({ page_id: id });
+                                allMentorCohortPagesCache.set(id, page);
+                                return page;
+                            } catch (error) {
+                                return null;
                             }
-                        },
-                        page_size: 100
-                    });
-                    taRollupQuery.results?.forEach((page: any) => mentorCohortIds.add(page.id));
-                } catch (error: any) {
-                    // Ignorar errores de tipo de propiedad (puede ser relación directa, no rollup)
+                        })
+                    );
                 }
-                
-                // Buscar en Teacher (tanto relación directa como rollup)
-                try {
-                    const teacherDirectQuery = await notion.databases.query({
-                        database_id: COHORTS_DB_FOR_INFO,
-                        filter: {
-                            property: 'Teacher',
-                            relation: {
-                                contains: originalMentorId
-                            }
-                        },
-                        page_size: 100
-                    });
-                    teacherDirectQuery.results?.forEach((page: any) => mentorCohortIds.add(page.id));
-                } catch (error: any) {
-                    // Ignorar errores
-                }
-                
-                try {
-                    const teacherRollupQuery = await notion.databases.query({
-                        database_id: COHORTS_DB_FOR_INFO,
-                        filter: {
-                            property: 'Teacher',
-                            rollup: {
-                                any: {
-                                    relation: {
-                                        contains: originalMentorId
-                                    }
-                                }
-                            }
-                        },
-                        page_size: 100
-                    });
-                    teacherRollupQuery.results?.forEach((page: any) => mentorCohortIds.add(page.id));
-                } catch (error: any) {
-                    // Ignorar errores
-                }
-                
-                // Convertir Set a Array
-                const mentorCohortIdsArray = Array.from(mentorCohortIds);
-                
-                // Obtener información de las cohortes encontradas
-                const allCohortPages = await Promise.all(
-                    mentorCohortIdsArray.map(async (id) => {
-                        try {
-                            return await notion.pages.retrieve({ page_id: id });
-                        } catch (error) {
-                            return null;
-                        }
-                    })
-                );
-                
-                const mentorCohortNames = allCohortPages.filter(p => p !== null).map((page: any) => {
-                    const name = page.properties?.Cohort?.title?.[0]?.plain_text ||
-                               page.properties?.Title?.title?.[0]?.plain_text ||
-                               'Sin nombre';
-                    const status = page.properties?.['Cohort Status ']?.select?.name ||
-                                  page.properties?.['Cohort Status']?.select?.name ||
-                                  page.properties?.Status?.select?.name ||
-                                  'sin estado';
-                    return { id: page.id, name, status };
-                });
-                
-                // Agregar todas las cohortes encontradas a la lista conocida
-                mentorCohortIdsArray.forEach(id => allKnownMentorCohortIds.add(id));
             } catch (error: any) {
                 // Ignorar errores
             }
@@ -2345,16 +2262,27 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         // Combinar todas las cohortes
         const allCohortIds = [...cohortIdsFromEvaluations, ...additionalCohortIds];
         
-        const cohortPages = await Promise.all(
-            allCohortIds.map(async (id) => {
+        // OPTIMIZACIÓN: Usar cache cuando sea posible, solo consultar las faltantes
+        const cohortPagesToFetch = allCohortIds.filter(id => !allMentorCohortPagesCache.has(id));
+        const cohortPagesFromCache = allCohortIds
+            .filter(id => allMentorCohortPagesCache.has(id))
+            .map(id => allMentorCohortPagesCache.get(id)!);
+        
+        // Solo consultar las cohortes que no están en el cache
+        const cohortPagesFetched = cohortPagesToFetch.length > 0 ? await Promise.all(
+            cohortPagesToFetch.map(async (id) => {
                 try {
                     const page = await notion.pages.retrieve({ page_id: id });
+                    allMentorCohortPagesCache.set(id, page);
                     return page;
                 } catch (error) {
                     return null;
                 }
             })
-        );
+        ) : [];
+        
+        // Combinar cache y consultas
+        const cohortPages = [...cohortPagesFromCache, ...cohortPagesFetched];
 
         // Estados permitidos para mostrar NPS
         const allowedStatuses = ['Active', 'Final Project', 'Finished'];
