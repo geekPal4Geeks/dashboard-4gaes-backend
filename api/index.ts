@@ -909,10 +909,13 @@ function isMentorResponsibleForEvaluation(
     teacherIds: string[],
     currentMentorId: string
 ): { isResponsible: boolean; reason: string; originalMentorId?: string; newMentorId?: string } {
+    // Normalizar todos los IDs removiendo guiones para comparar correctamente
+    const normalizedTeacherIds = teacherIds.map(id => id.replace(/-/g, ''));
+    const normalizedCurrentMentorId = currentMentorId.replace(/-/g, '');
 
     // Caso 1: Sin cambio de mentor (1 mentor o sin fecha de cambio)
-    if (!mentorChangeDate || teacherIds.length === 1) {
-        const isResponsible = teacherIds.includes(currentMentorId);
+    if (!mentorChangeDate || normalizedTeacherIds.length === 1) {
+        const isResponsible = normalizedTeacherIds.includes(normalizedCurrentMentorId);
         return {
             isResponsible,
             reason: isResponsible ? 'Mentor único - responsable de todas las evaluaciones' : 'Mentor único - no es el mentor asignado'
@@ -920,35 +923,35 @@ function isMentorResponsibleForEvaluation(
     }
 
     // Caso 2: Con cambio de mentor (2 mentores + fecha de cambio)
-    if (teacherIds.length === 2) {
-        const originalMentorId = teacherIds[0]; // Primer mentor (original)
-        const newMentorId = teacherIds[1];      // Segundo mentor (nuevo)
+    if (normalizedTeacherIds.length === 2) {
+        const originalMentorId = normalizedTeacherIds[0]; // Primer mentor (original)
+        const newMentorId = normalizedTeacherIds[1];      // Segundo mentor (nuevo)
 
         const evaluationTime = new Date(evaluationDate).getTime();
         const changeTime = new Date(mentorChangeDate).getTime();
 
         // Evaluación ANTES del cambio → Original mentor es responsable
         if (evaluationTime < changeTime) {
-            const isOriginalMentor = currentMentorId === originalMentorId;
+            const isOriginalMentor = normalizedCurrentMentorId === originalMentorId;
             return {
                 isResponsible: isOriginalMentor,
                 reason: isOriginalMentor ?
                     'Evaluación antes del cambio - mentor original responsable' :
                     'Evaluación antes del cambio - mentor nuevo no responsable',
-                originalMentorId,
-                newMentorId
+                originalMentorId: teacherIds[0], // Mantener formato original con guiones para respuesta
+                newMentorId: teacherIds[1]       // Mantener formato original con guiones para respuesta
             };
         }
 
         // Evaluación DESPUÉS del cambio → Nuevo mentor es responsable
-        const isNewMentor = currentMentorId === newMentorId;
+        const isNewMentor = normalizedCurrentMentorId === newMentorId;
         return {
             isResponsible: isNewMentor,
             reason: isNewMentor ?
                 'Evaluación después del cambio - mentor nuevo responsable' :
                 'Evaluación después del cambio - mentor original no responsable',
-            originalMentorId,
-            newMentorId
+            originalMentorId: teacherIds[0], // Mantener formato original con guiones para respuesta
+            newMentorId: teacherIds[1]       // Mantener formato original con guiones para respuesta
         };
     }
 
@@ -1118,16 +1121,15 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             });
         }
 
-        // Normalizar UUID removiendo guiones para consistencia
+        // Guardar el mentorId original (con guiones) para usar en filtros de Notion
+        const originalMentorId = mentorId;
+        // Normalizar UUID removiendo guiones para comparaciones en código
         const normalizedMentorId = mentorId.replace(/-/g, '');
-        console.log('✅ [mentor-nps] MentorId normalizado:', {
-            original: mentorId,
+        console.log('✅ [mentor-nps] MentorId procesado:', {
+            original: originalMentorId,
             normalized: normalizedMentorId,
             length: normalizedMentorId.length
         });
-        
-        // Usar el mentorId normalizado para el resto del código
-        mentorId = normalizedMentorId;
 
         const NPS_DB = process.env.NOTION_NPS_DATABASE_ID || '';
         if (!NPS_DB) {
@@ -1144,6 +1146,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         );
 
         // Construir filtro base según el rol
+        // Nota: Notion espera IDs con guiones en los filtros de relaciones
         let filter: any;
 
         if (isAssistant) {
@@ -1155,13 +1158,14 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                         rollup: {
                             any: {
                                 relation: {
-                                    contains: mentorId
+                                    contains: originalMentorId
                                 }
                             }
                         }
                     }
                 ]
             };
+            console.log('🔍 [mentor-nps] Filtro para Assistant:', JSON.stringify(filter, null, 2));
         } else {
             // Para teachers, usar la propiedad Teacher (comportamiento actual)
             filter = {
@@ -1171,7 +1175,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                         rollup: {
                             any: {
                                 relation: {
-                                    contains: mentorId
+                                    contains: originalMentorId
                                 }
                             }
                         }
@@ -1204,9 +1208,34 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         // Obtener todas las páginas de NPS del mentor (incluyendo las que no le corresponden)
         let allPages: any[];
         try {
+            console.log('🔍 [mentor-nps] Ejecutando consulta a Notion:', {
+                databaseId: NPS_DB,
+                filter: JSON.stringify(filter, null, 2),
+                mentorId: originalMentorId,
+                normalizedMentorId,
+                userRole: isAssistant ? 'assistant' : 'teacher'
+            });
+            
             allPages = await notionQueryAll(NPS_DB, filter);
+            
+            console.log('📊 [mentor-nps] Resultado de consulta Notion:', {
+                totalPages: allPages.length,
+                mentorId: originalMentorId,
+                normalizedMentorId,
+                userRole: isAssistant ? 'assistant' : 'teacher'
+            });
+            
+            if (allPages.length === 0) {
+                console.log('⚠️ [mentor-nps] No se encontraron evaluaciones NPS para este mentor');
+            }
         } catch (error) {
-            console.error('Error consultando Notion:', error);
+            console.error('❌ [mentor-nps] Error consultando Notion:', {
+                error: error.message,
+                databaseId: NPS_DB,
+                filter: JSON.stringify(filter, null, 2),
+                mentorId: originalMentorId,
+                normalizedMentorId
+            });
             return res.status(500).json({
                 error: 'Error consultando Notion',
                 details: error.message,
@@ -1226,8 +1255,21 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                 // Verificar que el TA actual esté en la lista de TAs de la evaluación
                 const taRelation = props['T.A.']?.relation || props['T.A.']?.rollup?.array?.[0]?.relation || [];
                 const taIds = taRelation.map((t: any) => t.id);
+                // Normalizar los IDs removiendo guiones para comparar correctamente
+                const normalizedTaIds = taIds.map((id: string) => id.replace(/-/g, ''));
 
-                if (taIds.includes(mentorId)) {
+                console.log('🔍 [mentor-nps] Procesando evaluación para assistant:', {
+                    npsId: props['NPS ID']?.title?.[0]?.plain_text || 'sin ID',
+                    originalMentorId,
+                    normalizedMentorId,
+                    taProperty: props['T.A.'],
+                    taRelation,
+                    taIds,
+                    normalizedTaIds,
+                    mentorIdIncluded: normalizedTaIds.includes(normalizedMentorId)
+                });
+
+                if (normalizedTaIds.includes(normalizedMentorId)) {
                     pages.push(page);
                 } else {
                     skippedEvaluations.push({
@@ -1251,11 +1293,12 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                     props['NPS ID']?.title?.[0]?.plain_text || '';
 
                 // Determinar si el mentor actual es responsable de esta evaluación
+                // Usar el mentorId normalizado para comparaciones
                 const responsibility = isMentorResponsibleForEvaluation(
                     evaluationDate,
                     mentorChangeDate,
                     teacherIds,
-                    mentorId
+                    normalizedMentorId
                 );
 
                 if (responsibility.isResponsible) {
@@ -1772,7 +1815,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
 
             // Metadatos
             metadata: {
-                mentorId,
+                mentorId: originalMentorId,
                 mentorName,
                 lastUpdated: new Date().toISOString(),
                 dataPoints: {
@@ -1806,7 +1849,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                 averageParticipation: visualizationData.kpis?.averageParticipation || 0
             },
             metadata: {
-                mentorId,
+                mentorId: originalMentorId,
                 mentorName,
                 lastUpdated: new Date().toISOString(),
                 dataPoints: {
@@ -1828,7 +1871,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             },
             totalCohorts: resultActive.length + resultPast.length,
             totalEvaluations: validationStats.assignedEvaluations,
-            mentorId,
+            mentorId: originalMentorId,
             mentorName,
             userRole: isAssistant ? 'assistant' : 'teacher', // Añadir rol del usuario
             visualizationData: safeVisualizationData,
@@ -1956,6 +1999,394 @@ app.put('/api/mentor-nps/evaluation-seen', authorizeTeachersOrAssistants(), asyn
 });
 
 
+
+// Endpoint de prueba para diagnosticar assistants sin autenticación
+app.post('/api/mentors/test-assistant', async (req, res) => {
+    try {
+        const { email } = req.body;
+        
+        if (!email) {
+            return res.status(400).json({ 
+                error: 'Se requiere email',
+                example: { email: 'torres_rominav@hotmail.com' }
+            });
+        }
+
+        console.log('🔍 [test-assistant] Iniciando prueba para:', email);
+
+        const MENTORS_DB = process.env.NOTION_MENTORS_DATABASE_ID || '';
+        const NPS_DB = process.env.NOTION_NPS_DATABASE_ID || '';
+
+        if (!MENTORS_DB || !NPS_DB) {
+            return res.status(500).json({ 
+                error: 'Variables de entorno faltantes',
+                mentorsDb: !!MENTORS_DB,
+                npsDb: !!NPS_DB
+            });
+        }
+
+        // Paso 1: Buscar el mentor en la base de datos de mentores
+        console.log('🔍 [test-assistant] Paso 1: Buscando mentor en base de datos de mentores');
+        const mentorQuery = await notion.databases.query({
+            database_id: MENTORS_DB,
+            filter: { property: 'Correo', email: { equals: email } }
+        });
+
+        if (!mentorQuery.results?.length) {
+            return res.status(404).json({ 
+                error: 'Mentor no encontrado',
+                email,
+                databaseId: MENTORS_DB
+            });
+        }
+
+        const mentor = mentorQuery.results[0] as any;
+        const mentorId = mentor.id;
+        const mentorName = mentor.properties?.Name?.title?.[0]?.plain_text || 'Sin nombre';
+
+        console.log('✅ [test-assistant] Mentor encontrado:', {
+            mentorId,
+            mentorName,
+            email
+        });
+
+        // Paso 2: Probar diferentes filtros en la base de datos NPS
+        console.log('🔍 [test-assistant] Paso 2: Probando filtros en base de datos NPS');
+        
+        const filterTests = [
+            {
+                name: 'Filtro T.A. con rollup (actual)',
+                filter: {
+                    and: [
+                        {
+                            property: 'T.A.',
+                            rollup: {
+                                any: {
+                                    relation: {
+                                        contains: mentorId
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                name: 'Filtro T.A. directo (sin rollup)',
+                filter: {
+                    property: 'T.A.',
+                    relation: {
+                        contains: mentorId
+                    }
+                }
+            },
+            {
+                name: 'Filtro T.A. con contains directo',
+                filter: {
+                    property: 'T.A.',
+                    contains: mentorId
+                }
+            },
+            {
+                name: 'Filtro Teacher (para comparar)',
+                filter: {
+                    property: 'Teacher',
+                    rollup: {
+                        any: {
+                            relation: {
+                                contains: mentorId
+                            }
+                        }
+                    }
+                }
+            }
+        ];
+
+        const results = [];
+
+        for (const test of filterTests) {
+            try {
+                console.log(`🔍 [test-assistant] Probando: ${test.name}`);
+                
+                const queryResult = await notion.databases.query({
+                    database_id: NPS_DB,
+                    filter: test.filter as any
+                });
+
+                results.push({
+                    filterName: test.name,
+                    totalResults: queryResult.results?.length || 0,
+                    success: true,
+                    error: null,
+                    sampleResults: queryResult.results?.slice(0, 3).map((page: any) => ({
+                        id: page.id,
+                        npsId: page.properties?.['NPS ID']?.title?.[0]?.plain_text || 'Sin ID',
+                        taRelation: page.properties?.['T.A.']?.relation || page.properties?.['T.A.']?.rollup || 'Sin relación',
+                        teacherRelation: page.properties?.['Teacher']?.relation || page.properties?.['Teacher']?.rollup || 'Sin relación',
+                        cohortRelation: page.properties?.['Cohorts']?.relation || 'Sin relación'
+                    })) || []
+                });
+
+                console.log(`✅ [test-assistant] ${test.name}: ${queryResult.results?.length || 0} resultados`);
+            } catch (error: any) {
+                results.push({
+                    filterName: test.name,
+                    totalResults: 0,
+                    success: false,
+                    error: error.message,
+                    sampleResults: []
+                });
+                console.log(`❌ [test-assistant] ${test.name}: Error - ${error.message}`);
+            }
+        }
+
+        // Paso 3: Obtener información de la estructura de la base de datos
+        console.log('🔍 [test-assistant] Paso 3: Analizando estructura de base de datos');
+        let databaseInfo = null;
+        try {
+            const dbInfo = await notion.databases.retrieve({ database_id: NPS_DB });
+            databaseInfo = {
+                id: dbInfo.id,
+                title: (dbInfo as any).title?.[0]?.plain_text || 'Sin título',
+                properties: Object.keys((dbInfo as any).properties || {}),
+                taPropertyExists: !!(dbInfo as any).properties?.['T.A.'],
+                taPropertyType: (dbInfo as any).properties?.['T.A.']?.type || 'No encontrado',
+                teacherPropertyExists: !!(dbInfo as any).properties?.['Teacher'],
+                teacherPropertyType: (dbInfo as any).properties?.['Teacher']?.type || 'No encontrado'
+            };
+        } catch (error: any) {
+            databaseInfo = { error: error.message };
+        }
+
+        // Paso 4: Buscar todas las evaluaciones para ver si hay alguna con este TA
+        console.log('🔍 [test-assistant] Paso 4: Buscando todas las evaluaciones para encontrar referencias');
+        let allEvaluations = [];
+        try {
+            const allQuery = await notion.databases.query({
+                database_id: NPS_DB,
+                page_size: 100 // Limitar para no sobrecargar
+            });
+            
+            allEvaluations = allQuery.results?.slice(0, 10).map((page: any) => ({
+                id: page.id,
+                npsId: page.properties?.['NPS ID']?.title?.[0]?.plain_text || 'Sin ID',
+                taRelation: page.properties?.['T.A.']?.relation || page.properties?.['T.A.']?.rollup || 'Sin relación',
+                teacherRelation: page.properties?.['Teacher']?.relation || page.properties?.['Teacher']?.rollup || 'Sin relación',
+                hasOurMentorId: JSON.stringify(page.properties).includes(mentorId)
+            })) || [];
+        } catch (error: any) {
+            console.log('⚠️ [test-assistant] Error obteniendo todas las evaluaciones:', error.message);
+        }
+
+        const diagnosis = {
+            testInfo: {
+                email,
+                mentorId,
+                mentorName,
+                timestamp: new Date().toISOString()
+            },
+            databaseInfo,
+            filterTests: results,
+            allEvaluationsSample: allEvaluations,
+            recommendations: []
+        };
+
+        // Generar recomendaciones
+        const successfulFilters = results.filter(r => r.success && r.totalResults > 0);
+        const failedFilters = results.filter(r => !r.success);
+
+        if (successfulFilters.length === 0) {
+            diagnosis.recommendations.push('❌ Ningún filtro encontró evaluaciones - el assistant no está asociado a evaluaciones NPS');
+            diagnosis.recommendations.push('💡 Verificar en Notion que las evaluaciones NPS tengan este assistant en la propiedad T.A.');
+        } else {
+            diagnosis.recommendations.push(`✅ Usar el filtro "${successfulFilters[0].filterName}" que encontró ${successfulFilters[0].totalResults} evaluaciones`);
+        }
+
+        if (failedFilters.length > 0) {
+            diagnosis.recommendations.push('⚠️ Algunos filtros fallaron - verificar la estructura de la base de datos NPS');
+        }
+
+        if (allEvaluations.length > 0) {
+            const hasReferences = allEvaluations.some((evaluation:any) => evaluation.hasOurMentorId);
+            if (hasReferences) {
+                diagnosis.recommendations.push('🔍 Se encontraron referencias al mentorId en otras propiedades');
+            } else {
+                diagnosis.recommendations.push('❌ No se encontraron referencias al mentorId en ninguna evaluación');
+            }
+        }
+
+        console.log('✅ [test-assistant] Diagnóstico completado:', diagnosis);
+
+        res.status(200).json(diagnosis);
+    } catch (err: any) {
+        console.error('❌ [test-assistant] Error:', err);
+        res.status(500).json({ 
+            error: 'Error en prueba de assistant',
+            details: err.message
+        });
+    }
+});
+
+// Endpoint específico para diagnosticar problemas de assistants
+app.post('/api/mentors/assistant-debug', authorizeTeachersOrAssistants(), async (req, res) => {
+    try {
+        const email = (req as any).user4GeeksData?.email;
+        const userRoles = (req as any).user4GeeksData?.roles || [];
+        
+        if (!email) {
+            return res.status(400).json({ error: 'No se encontró email en el token' });
+        }
+
+        const isAssistant = userRoles.some((roleObj: any) =>
+            roleObj.role === 'assistant' && roleObj.academy && roleObj.academy.id === 6
+        );
+
+        if (!isAssistant) {
+            return res.status(400).json({ error: 'Este endpoint es solo para assistants' });
+        }
+
+        console.log('🔍 [assistant-debug] Iniciando diagnóstico para assistant:', email);
+
+        // Obtener mentorId
+        let mentorId: string;
+        try {
+            mentorId = await resolveMentorIdFromReq(req);
+        } catch (error: any) {
+            return res.status(400).json({ error: error.message });
+        }
+
+        const NPS_DB = process.env.NOTION_NPS_DATABASE_ID || '';
+        if (!NPS_DB) {
+            return res.status(500).json({ error: 'Falta NOTION_NPS_DATABASE_ID' });
+        }
+
+        // Probar diferentes tipos de filtros para assistants
+        const filterTests = [
+            {
+                name: 'Filtro T.A. con rollup (actual)',
+                filter: {
+                    and: [
+                        {
+                            property: 'T.A.',
+                            rollup: {
+                                any: {
+                                    relation: {
+                                        contains: mentorId
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                name: 'Filtro T.A. directo (sin rollup)',
+                filter: {
+                    property: 'T.A.',
+                    relation: {
+                        contains: mentorId
+                    }
+                }
+            },
+            {
+                name: 'Filtro T.A. con contains directo',
+                filter: {
+                    property: 'T.A.',
+                    contains: mentorId
+                }
+            }
+        ];
+
+        const results = [];
+
+        for (const test of filterTests) {
+            try {
+                console.log(`🔍 [assistant-debug] Probando: ${test.name}`);
+                
+                const queryResult = await notion.databases.query({
+                    database_id: NPS_DB,
+                    filter: test.filter as any
+                });
+
+                results.push({
+                    filterName: test.name,
+                    filter: test.filter,
+                    totalResults: queryResult.results?.length || 0,
+                    success: true,
+                    error: null,
+                    sampleResults: queryResult.results?.slice(0, 2).map((page: any) => ({
+                        id: page.id,
+                        npsId: page.properties?.['NPS ID']?.title?.[0]?.plain_text || 'Sin ID',
+                        taRelation: page.properties?.['T.A.']?.relation || page.properties?.['T.A.']?.rollup || 'Sin relación'
+                    })) || []
+                });
+
+                console.log(`✅ [assistant-debug] ${test.name}: ${queryResult.results?.length || 0} resultados`);
+            } catch (error: any) {
+                results.push({
+                    filterName: test.name,
+                    filter: test.filter,
+                    totalResults: 0,
+                    success: false,
+                    error: error.message,
+                    sampleResults: []
+                });
+                console.log(`❌ [assistant-debug] ${test.name}: Error - ${error.message}`);
+            }
+        }
+
+        // También obtener información sobre la estructura de la base de datos
+        let databaseInfo = null;
+        try {
+            const dbInfo = await notion.databases.retrieve({ database_id: NPS_DB });
+            databaseInfo = {
+                id: dbInfo.id,
+                title: (dbInfo as any).title?.[0]?.plain_text || 'Sin título',
+                properties: Object.keys((dbInfo as any).properties || {}),
+                taPropertyExists: !!(dbInfo as any).properties?.['T.A.'],
+                taPropertyType: (dbInfo as any).properties?.['T.A.']?.type || 'No encontrado'
+            };
+        } catch (error: any) {
+            databaseInfo = { error: error.message };
+        }
+
+        const diagnosis = {
+            userInfo: {
+                email,
+                mentorId,
+                roles: userRoles,
+                isAssistant
+            },
+            databaseInfo,
+            filterTests: results,
+            recommendations: []
+        };
+
+        // Generar recomendaciones
+        const successfulFilters = results.filter(r => r.success && r.totalResults > 0);
+        const failedFilters = results.filter(r => !r.success);
+
+        if (successfulFilters.length === 0) {
+            diagnosis.recommendations.push('Ningún filtro encontró evaluaciones - verificar que el assistant esté asociado a evaluaciones NPS');
+        } else {
+            diagnosis.recommendations.push(`Usar el filtro "${successfulFilters[0].filterName}" que encontró ${successfulFilters[0].totalResults} evaluaciones`);
+        }
+
+        if (failedFilters.length > 0) {
+            diagnosis.recommendations.push('Algunos filtros fallaron - verificar la estructura de la base de datos NPS');
+        }
+
+        console.log('✅ [assistant-debug] Diagnóstico completado:', diagnosis);
+
+        res.status(200).json(diagnosis);
+    } catch (err: any) {
+        console.error('❌ [assistant-debug] Error:', err);
+        res.status(500).json({ 
+            error: 'Error en diagnóstico de assistant',
+            details: err.message
+        });
+    }
+});
 
 // Endpoint para demostrar el problema de tipos con mentorId
 app.post('/api/mentors/type-demo', authorizeTeachersOrAssistants(), async (req, res) => {
