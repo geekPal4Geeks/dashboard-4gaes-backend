@@ -8,6 +8,27 @@ import bodyParser from 'body-parser';
 import path from 'path';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
+import {
+    getCurrentPeriodDates,
+    getPreviousPeriodDates,
+    getCurrentMonthlyPeriodDates,
+    getPreviousMonthlyPeriodDates
+} from './utils/dateCalculations.js';
+import {
+    MentorshipSession,
+    getMentorshipStartTime,
+    getMentorshipEndTime,
+    calculateDuration,
+    determineServiceType,
+    calculateMentorshipStatus,
+    getStudentName,
+    getServiceName,
+} from './utils/mentorshipProcessing.js';
+import { fetchMentorSessions } from './utils/breathcodeApi.js';
+import {
+    ProcessedMentorship,
+    generateMonthlySummaries,
+} from './utils/monthlySummaries.js';
 
 
 
@@ -124,9 +145,9 @@ app.get('/', function (req, res) {
 app.post('/api/mentor-nps-test', async (req, res) => {
     try {
         const { email, mentorId: mentorIdFromBody, startDate, endDate, includePast = true } = req.body;
-        
+
         if (!email && !mentorIdFromBody) {
-            return res.status(400).json({ 
+            return res.status(400).json({
                 error: 'Se requiere email o mentorId',
                 example: { email: 'hector@chocbar.net' }
             });
@@ -144,7 +165,7 @@ app.post('/api/mentor-nps-test', async (req, res) => {
         } as any;
 
         let mentorId: string | undefined = mentorIdFromBody;
-        
+
         // Si no se proporciona mentorId, resolverlo desde el email
         if (!mentorId && email) {
             console.log('🔍 [mentor-nps-test] Resolviendo mentorId desde email:', email);
@@ -153,8 +174,8 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                 console.log('✅ [mentor-nps-test] MentorId resuelto:', mentorId);
             } catch (error: any) {
                 console.error('❌ [mentor-nps-test] Error resolviendo mentorId:', error.message);
-                return res.status(400).json({ 
-                    error: 'Error resolviendo mentorId', 
+                return res.status(400).json({
+                    error: 'Error resolviendo mentorId',
                     details: error.message,
                     email: email,
                     troubleshooting: {
@@ -168,7 +189,7 @@ app.post('/api/mentor-nps-test', async (req, res) => {
 
         // Validar formato UUID
         if (!mentorId) {
-            return res.status(400).json({ 
+            return res.status(400).json({
                 error: 'MentorId faltante',
                 details: 'No se pudo obtener el mentorId ni del body ni del email'
             });
@@ -176,9 +197,9 @@ app.post('/api/mentor-nps-test', async (req, res) => {
 
         const uuidWithDashesRegex = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
         const uuidWithoutDashesRegex = /^[a-f0-9]{32}$/i;
-        
+
         if (!uuidWithDashesRegex.test(mentorId) && !uuidWithoutDashesRegex.test(mentorId)) {
-            return res.status(400).json({ 
+            return res.status(400).json({
                 error: 'Formato de MentorId inválido',
                 details: 'El mentorId debe ser un UUID válido de Notion',
                 received: {
@@ -211,11 +232,11 @@ app.post('/api/mentor-nps-test', async (req, res) => {
         // Esto es más robusto que depender solo del filtro de rollup de Notion
         const COHORTS_DB_FOR_EVALS_SEARCH = process.env.NOTION_COHORTS_DATABASE_ID || process.env.NOTION_DATABASE_ID || '';
         console.log('🔍 [mentor-nps-test] Estrategia mejorada: Buscando cohortes primero, luego evaluaciones');
-        
+
         // Paso 1: Buscar todas las cohortes asignadas al mentor
         const COHORTS_DB = process.env.NOTION_DATABASE_ID || '';
         let allMentorCohortIds = new Set<string>();
-        
+
         if (COHORTS_DB && COHORTS_DB_FOR_EVALS_SEARCH) {
             try {
                 // Buscar en T.A. (directo y rollup)
@@ -226,7 +247,7 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                         page_size: 100
                     });
                     taDirectQuery.results?.forEach((page: any) => allMentorCohortIds.add(page.id));
-                    
+
                     const taRollupQuery = await notion.databases.query({
                         database_id: COHORTS_DB_FOR_EVALS_SEARCH,
                         filter: { property: 'T.A.', rollup: { any: { relation: { contains: originalMentorId } } } },
@@ -236,7 +257,7 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                 } catch (error: any) {
                     console.log(`⚠️ [mentor-nps-test] Error buscando T.A.: ${error.message}`);
                 }
-                
+
                 // Buscar en Teacher (directo y rollup)
                 try {
                     const teacherDirectQuery = await notion.databases.query({
@@ -245,7 +266,7 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                         page_size: 100
                     });
                     teacherDirectQuery.results?.forEach((page: any) => allMentorCohortIds.add(page.id));
-                    
+
                     const teacherRollupQuery = await notion.databases.query({
                         database_id: COHORTS_DB_FOR_EVALS_SEARCH,
                         filter: { property: 'Teacher', rollup: { any: { relation: { contains: originalMentorId } } } },
@@ -255,28 +276,28 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                 } catch (error: any) {
                     console.log(`⚠️ [mentor-nps-test] Error buscando Teacher: ${error.message}`);
                 }
-                
+
                 console.log(`📊 [mentor-nps-test] Cohortes encontradas del mentor: ${allMentorCohortIds.size}`);
             } catch (error: any) {
                 console.log(`⚠️ [mentor-nps-test] Error buscando cohortes: ${error.message}`);
             }
         }
-        
+
         // Paso 2: Para cada cohorte, buscar directamente sus evaluaciones NPS relacionadas
         let allPages: any[] = [];
         let isAssistant = false;
         let isTeacher = false;
-        
+
         if (allMentorCohortIds.size > 0) {
             try {
                 const cohortIdsArray = Array.from(allMentorCohortIds);
                 console.log(`🔍 [mentor-nps-test] Buscando evaluaciones NPS para ${cohortIdsArray.length} cohortes...`);
-                
+
                 // Si hay muchas cohortes, dividir en lotes (Notion tiene límites en filtros OR)
                 const BATCH_SIZE = 10;
                 for (let i = 0; i < cohortIdsArray.length; i += BATCH_SIZE) {
                     const batch = cohortIdsArray.slice(i, i + BATCH_SIZE);
-                    
+
                     // Buscar evaluaciones que tengan CUALQUIERA de estas cohortes
                     const cohortFilter = {
                         or: batch.map(cohortId => ({
@@ -284,7 +305,7 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                             relation: { contains: cohortId }
                         }))
                     };
-                    
+
                     // Agregar filtros de fecha si existen
                     let finalFilter: any = cohortFilter;
                     if (startDate || endDate) {
@@ -303,12 +324,12 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                         }
                         finalFilter = { and: [cohortFilter, ...dateFilters] };
                     }
-                    
+
                     const batchResults = await notionQueryAll(NPS_DB, finalFilter);
                     allPages.push(...batchResults);
-                    console.log(`📊 [mentor-nps-test] Lote ${Math.floor(i/BATCH_SIZE) + 1}: ${batchResults.length} evaluaciones encontradas`);
+                    console.log(`📊 [mentor-nps-test] Lote ${Math.floor(i / BATCH_SIZE) + 1}: ${batchResults.length} evaluaciones encontradas`);
                 }
-                
+
                 // Eliminar duplicados (una evaluación puede estar relacionada a múltiples cohortes)
                 const uniquePageIds = new Set();
                 allPages = allPages.filter(page => {
@@ -318,23 +339,23 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                     uniquePageIds.add(page.id);
                     return true;
                 });
-                
+
                 console.log(`✅ [mentor-nps-test] Total evaluaciones encontradas para cohortes del mentor: ${allPages.length}`);
-                
+
                 // Si encontramos evaluaciones, determinar el rol basándonos en la primera evaluación
                 if (allPages.length > 0) {
                     const firstPage = allPages[0];
                     const firstProps = (firstPage as any).properties || {};
-                    
+
                     // Verificar si tiene T.A. o Teacher
                     const hasTA = !!(firstProps['T.A.']?.relation || firstProps['T.A.']?.rollup);
                     const hasTeacher = !!(firstProps['Teacher']?.relation || firstProps['Teacher']?.rollup);
-                    
+
                     // Intentar determinar el rol: si el mentor está en T.A., es assistant; si está en Teacher, es teacher
                     const taRelation = firstProps['T.A.']?.relation || firstProps['T.A.']?.rollup?.array?.[0]?.relation || [];
                     const taIds = taRelation.map((t: any) => t.id).filter((id: string) => typeof id === 'string');
                     const normalizedTaIds = taIds.map((id: string) => id.replace(/-/g, ''));
-                    
+
                     if (normalizedTaIds.includes(normalizedMentorId)) {
                         isAssistant = true;
                         console.log(`✅ [mentor-nps-test] Rol determinado: Assistant (encontrado en T.A.)`);
@@ -342,7 +363,7 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                         const teacherRelation = firstProps['Teacher']?.relation || firstProps['Teacher']?.rollup?.array?.[0]?.relation || [];
                         const teacherIds = teacherRelation.map((t: any) => t.id).filter((id: string) => typeof id === 'string');
                         const normalizedTeacherIds = teacherIds.map((id: string) => id.replace(/-/g, ''));
-                        
+
                         if (normalizedTeacherIds.includes(normalizedMentorId)) {
                             isTeacher = true;
                             console.log(`✅ [mentor-nps-test] Rol determinado: Teacher (encontrado en Teacher)`);
@@ -354,12 +375,12 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                 console.error('Stack:', error.stack);
             }
         }
-        
+
         // Paso 3: También intentar el método tradicional (filtro por rollup) como respaldo
         // Esto captura evaluaciones que podrían no estar vinculadas correctamente a las cohortes
         if (allPages.length === 0) {
             console.log('🔍 [mentor-nps-test] Método tradicional: Buscando por rollup T.A./Teacher');
-            
+
             let filter: any = {
                 and: [{
                     property: 'T.A.',
@@ -384,7 +405,7 @@ app.post('/api/mentor-nps-test', async (req, res) => {
             } catch (error: any) {
                 console.log(`⚠️ [mentor-nps-test] Error método rollup T.A.: ${error.message}`);
             }
-            
+
             if (allPages.length === 0) {
                 filter = {
                     and: [{
@@ -412,7 +433,7 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                 }
             }
         }
-        
+
         if (allPages.length === 0) {
             return res.status(200).json({
                 success: false,
@@ -427,7 +448,7 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                 ]
             });
         }
-        
+
         // Eliminar duplicados finales
         const finalUniqueIds = new Set();
         allPages = allPages.filter(page => {
@@ -435,10 +456,10 @@ app.post('/api/mentor-nps-test', async (req, res) => {
             finalUniqueIds.add(page.id);
             return true;
         });
-        
+
         console.log(`📊 [mentor-nps-test] Total evaluaciones únicas encontradas: ${allPages.length}`);
         console.log(`📊 [mentor-nps-test] Rol detectado: ${isAssistant ? 'assistant' : isTeacher ? 'teacher' : 'desconocido'}`);
-        
+
         // Mostrar muestra de evaluaciones encontradas
         if (allPages.length > 0) {
             console.log('📋 [mentor-nps-test] Muestra de evaluaciones encontradas (primeras 3):');
@@ -454,7 +475,7 @@ app.post('/api/mentor-nps-test', async (req, res) => {
         // Filtrar evaluaciones que realmente corresponden al mentor
         const pages: any[] = [];
         const skippedEvaluations: any[] = [];
-        
+
         // IMPORTANTE: Verificar tanto TA como Teacher en cada evaluación, ya que el mentor
         // puede ser TA en unas evaluaciones y Teacher en otras de la misma cohorte
         for (const page of allPages) {
@@ -462,34 +483,34 @@ app.post('/api/mentor-nps-test', async (req, res) => {
             const npsId = props['NPS ID']?.title?.[0]?.plain_text || 'sin ID';
             const cohortRelation = props['Cohorts']?.relation || [];
             const cohortIdsInEval = cohortRelation.map((c: any) => c.id);
-            
+
             // Verificar si está como TA
             const taRelation = props['T.A.']?.relation || props['T.A.']?.rollup?.array?.[0]?.relation || [];
             const taIds = taRelation.map((t: any) => t.id);
             const normalizedTaIds = taIds.map((id: string) => id.replace(/-/g, ''));
             const isMentorTA = normalizedTaIds.includes(normalizedMentorId);
-            
+
             // Verificar si está como Teacher
             const teacherRelation = props['Teacher']?.relation || props['Teacher']?.rollup?.array?.[0]?.relation || [];
             const teacherIds = teacherRelation.map((t: any) => t.id);
             const normalizedTeacherIds = teacherIds.map((id: string) => id.replace(/-/g, ''));
-            
+
             // Si está como TA, incluirlo como assistant
             if (isMentorTA) {
                 pages.push(page);
                 isAssistant = true; // Actualizar el rol detectado
                 console.log(`✅ [mentor-nps-test] Evaluación ${npsId} INCLUIDA - Mentor está como TA`);
-            } 
+            }
             // Si está como Teacher, verificar responsabilidad
             else if (normalizedTeacherIds.includes(normalizedMentorId)) {
                 const mentorChangeDate = props['Mentor Change Date']?.rollup?.array?.[0]?.date?.start || null;
-                
+
                 // Extraer fecha de evaluación
                 const evaluationDate = props['Date of Creation']?.date?.start ||
                     props['Date of Creation']?.rich_text?.[0]?.plain_text ||
                     page.created_time ||
                     props['NPS ID']?.title?.[0]?.plain_text || '';
-                
+
                 // Determinar si el mentor actual es responsable de esta evaluación
                 const responsibility = isMentorResponsibleForEvaluation(
                     evaluationDate,
@@ -497,7 +518,7 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                     teacherIds,
                     normalizedMentorId
                 );
-                
+
                 if (responsibility.isResponsible) {
                     pages.push(page);
                     isTeacher = true; // Actualizar el rol detectado
@@ -527,14 +548,14 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                 });
             }
         }
-        
+
         console.log('📊 [mentor-nps-test] Resumen de filtrado:', {
             totalEncontradas: allPages.length,
             incluidas: pages.length,
             omitidas: skippedEvaluations.length,
             rolUsado: isAssistant ? 'assistant' : isTeacher ? 'teacher' : 'desconocido'
         });
-        
+
         // Mostrar muestra de evaluaciones omitidas para diagnóstico
         if (skippedEvaluations.length > 0 && skippedEvaluations.length <= 5) {
             console.log('🔍 [mentor-nps-test] Muestra de evaluaciones omitidas:');
@@ -557,11 +578,11 @@ app.post('/api/mentor-nps-test', async (req, res) => {
             const props = (page as any).properties || {};
             const cohortRelation = props['Cohorts']?.relation || [];
             const npsId = props['NPS ID']?.title?.[0]?.plain_text || 'sin ID';
-            
+
             for (const cohort of cohortRelation) {
                 const cohortId = cohort.id;
                 cohortIdsSet.add(cohortId);
-                
+
                 if (!cohortEvaluations.has(cohortId)) {
                     cohortEvaluations.set(cohortId, []);
                 }
@@ -571,20 +592,20 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                 });
             }
         }
-        
+
         // Nota: Ya no necesitamos buscar específicamente cohortes activas porque ahora buscamos
         // todas las evaluaciones de todas las cohortes del mentor desde el principio
-        
+
         // Ya tenemos todas las cohortes del mentor en allMentorCohortIds (encontradas al principio)
         // Ahora agregar cualquier cohorte adicional que encontramos en las evaluaciones pero que no estaba en allMentorCohortIds
         // y también agregar las cohortes de allMentorCohortIds que no tienen evaluaciones
         const cohortIdsFromEvaluations = Array.from(cohortIdsSet);
         const additionalCohortIds = Array.from(allMentorCohortIds).filter(id => !cohortIdsFromEvaluations.includes(id));
-        
+
         // Combinar todas las cohortes: las de las evaluaciones + las adicionales del mentor
         additionalCohortIds.forEach(id => cohortIdsSet.add(id));
         allMentorCohortIds.forEach(id => cohortIdsSet.add(id));
-        
+
         console.log(`📊 [mentor-nps-test] Cohortes totales: ${cohortIdsSet.size} (${cohortIdsFromEvaluations.length} con evaluaciones, ${additionalCohortIds.length} adicionales sin evaluaciones)`);
 
         // Obtener información de todas las cohortes
@@ -609,13 +630,13 @@ app.post('/api/mentor-nps-test', async (req, res) => {
                 const statusProp3 = page.properties?.Status?.select?.name;
                 const status = statusProp1 || statusProp2 || statusProp3 || 'sin estado';
                 const cohortName = page.properties?.Cohort?.title?.[0]?.plain_text ||
-                                 page.properties?.Title?.title?.[0]?.plain_text ||
-                                 'Cohorte sin nombre';
-                
+                    page.properties?.Title?.title?.[0]?.plain_text ||
+                    'Cohorte sin nombre';
+
                 const evaluations = cohortEvaluations.get(cohortId) || [];
                 const isActive = status === 'Active' || status === 'Final Project';
                 const isPast = status === 'Finished';
-                
+
                 return {
                     cohortId,
                     cohortName,
@@ -689,7 +710,7 @@ app.post('/api/mentor-nps-test', async (req, res) => {
 
     } catch (err: any) {
         console.error('❌ [mentor-nps-test] Error:', err);
-        res.status(500).json({ 
+        res.status(500).json({
             error: 'Error en prueba de mentor-nps',
             details: err.message
         });
@@ -1593,7 +1614,7 @@ async function resolveMentorIdFromReq(req: Request): Promise<string> {
             errorCode: error.code,
             errorType: error.type
         });
-        
+
         // Re-lanzar el error con más contexto
         throw new Error(`Error consultando mentor en Notion: ${error.message}`);
     }
@@ -1605,7 +1626,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         const { mentorId: mentorIdFromBody, startDate, endDate, includePast = true } = req.body;
 
         let mentorId: string | undefined = undefined;
-        
+
         // Procesar mentorIdFromBody si existe
         if (mentorIdFromBody !== undefined && mentorIdFromBody !== null) {
             // Convertir a string y validar formato básico
@@ -1618,7 +1639,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                     type: typeof mentorIdFromBody,
                     value: mentorIdFromBody
                 });
-                return res.status(400).json({ 
+                return res.status(400).json({
                     error: 'Tipo de mentorId inválido',
                     details: 'El mentorId debe ser un string o número',
                     received: {
@@ -1628,7 +1649,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                 });
             }
         }
-        
+
         // Si no se proporciona mentorId en el body, intentar resolverlo desde el token
         if (!mentorId) {
             try {
@@ -1638,8 +1659,8 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                     error: error.message,
                     email: (req as any).user4GeeksData?.email
                 });
-                return res.status(400).json({ 
-                    error: 'Error resolviendo mentorId', 
+                return res.status(400).json({
+                    error: 'Error resolviendo mentorId',
                     details: error.message,
                     troubleshooting: {
                         checkEmail: 'Verifica que el email del usuario esté registrado en la base de datos de mentores',
@@ -1654,7 +1675,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         // Validar que mentorId tenga el formato correcto (UUID de Notion)
         if (!mentorId) {
             console.error('❌ [mentor-nps] MentorId faltante');
-            return res.status(400).json({ 
+            return res.status(400).json({
                 error: 'MentorId faltante',
                 details: 'No se pudo obtener el mentorId ni del body ni del token'
             });
@@ -1663,7 +1684,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         // Validar formato UUID de Notion (acepta tanto formato con guiones como sin guiones)
         const uuidWithDashesRegex = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
         const uuidWithoutDashesRegex = /^[a-f0-9]{32}$/i;
-        
+
         if (!uuidWithDashesRegex.test(mentorId) && !uuidWithoutDashesRegex.test(mentorId)) {
             console.error('❌ [mentor-nps] MentorId con formato inválido:', {
                 mentorId,
@@ -1671,7 +1692,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                 isValidWithDashes: uuidWithDashesRegex.test(mentorId),
                 isValidWithoutDashes: uuidWithoutDashesRegex.test(mentorId)
             });
-            return res.status(400).json({ 
+            return res.status(400).json({
                 error: 'Formato de MentorId inválido',
                 details: 'El mentorId debe ser un UUID válido de Notion',
                 received: {
@@ -1715,13 +1736,13 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         let allMentorCohortIdsFromSearch = new Set<string>();
         // Guardar las páginas de cohortes para evitar consultas posteriores
         let allMentorCohortPagesCache = new Map<string, any>();
-        
+
         try {
             // Paso 1: Buscar todas las cohortes asignadas al mentor (T.A. y Teacher, directas y rollup)
             // OPTIMIZACIÓN: Paralelizar las 4 consultas para reducir tiempo de respuesta
             const allMentorCohortIds = new Set<string>();
             const allMentorCohortPages = new Map<string, any>();
-            
+
             try {
                 // Ejecutar las 4 consultas en paralelo para reducir latencia
                 const [taDirectResult, taRollupResult, teacherDirectResult, teacherRollupResult] = await Promise.allSettled([
@@ -1819,11 +1840,11 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                         }
                         finalFilter = { and: [cohortFilter, ...dateFilters] };
                     }
-                    
+
                     const batchResults = await notionQueryAll(NPS_DB, finalFilter);
                     allPages.push(...batchResults);
                 }
-                
+
                 // Eliminar duplicados (una evaluación puede estar relacionada a múltiples cohortes)
                 const uniquePageIds = new Set();
                 allPages = allPages.filter(page => {
@@ -1834,7 +1855,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                     return true;
                 });
             }
-            
+
             // Las cohortes encontradas ya están guardadas en allMentorCohortIdsFromSearch
 
             // Paso 3: Fallback al método tradicional SOLO si no se encontraron evaluaciones
@@ -1843,7 +1864,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             // (especialmente cohortes activas sin evaluaciones aún)
             if (allPages.length === 0 && !foundCohortIdsInSearch) {
                 const fallbackPages = new Set<string>();
-                
+
                 if (isAssistant) {
                     // Intentar T.A. directo
                     try {
@@ -1861,7 +1882,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                     } catch (error: any) {
                         // Ignorar errores
                     }
-                    
+
                     // Intentar T.A. rollup
                     try {
                         const taRollupFilter: any = {
@@ -1898,7 +1919,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                     } catch (error: any) {
                         // Ignorar errores
                     }
-                    
+
                     // Intentar Teacher rollup
                     try {
                         const teacherRollupFilter: any = {
@@ -1919,7 +1940,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                         // Ignorar errores
                     }
                 }
-                
+
                 // Convertir Set a Array
                 if (fallbackPages.size > 0) {
                     for (const pageId of fallbackPages) {
@@ -1949,32 +1970,32 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         for (const page of allPages) {
             const props = (page as any).properties || {};
             const npsId = props['NPS ID']?.title?.[0]?.plain_text || 'sin ID';
-            
+
             // Verificar si está como TA
             const taRelation = props['T.A.']?.relation || props['T.A.']?.rollup?.array?.[0]?.relation || [];
             const taIds = taRelation.map((t: any) => t.id);
             const normalizedTaIds = taIds.map((id: string) => id.replace(/-/g, ''));
             const isMentorTA = normalizedTaIds.includes(normalizedMentorId);
-            
+
             // Verificar si está como Teacher
             const teacherRelation = props['Teacher']?.relation || props['Teacher']?.rollup?.array?.[0]?.relation || [];
             const teacherIds = teacherRelation.map((t: any) => t.id);
             const normalizedTeacherIds = teacherIds.map((id: string) => id.replace(/-/g, ''));
-            
+
             // Si está como TA, incluirlo
             if (isMentorTA) {
                 pages.push(page);
-            } 
+            }
             // Si está como Teacher, verificar responsabilidad
             else if (normalizedTeacherIds.includes(normalizedMentorId)) {
                 const mentorChangeDate = props['Mentor Change Date']?.rollup?.array?.[0]?.date?.start || null;
-                
+
                 // Extraer fecha de evaluación
                 const evaluationDate = props['Date of Creation']?.date?.start ||
                     props['Date of Creation']?.rich_text?.[0]?.plain_text ||
                     page.created_time ||
                     props['NPS ID']?.title?.[0]?.plain_text || '';
-                
+
                 // Determinar si el mentor actual es responsable de esta evaluación
                 const responsibility = isMentorResponsibleForEvaluation(
                     evaluationDate,
@@ -1982,7 +2003,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                     teacherIds,
                     normalizedMentorId
                 );
-                
+
                 if (responsibility.isResponsible) {
                     pages.push(page);
                 } else {
@@ -2185,7 +2206,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             // Agrupar por cohorte
             for (const cohort of cohortRelation) {
                 const cohortId = cohort.id;
-                
+
                 if (!byCohort.has(cohortId)) {
                     byCohort.set(cohortId, { items: [] });
                 }
@@ -2210,19 +2231,19 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         // Obtener información de cohortes
         // Primero, obtener cohortes de las evaluaciones NPS
         const cohortIdsFromEvaluations = Array.from(byCohort.keys());
-        
+
         // También buscar cohortes asignadas directamente al mentor en la base de datos de cohortes
         // Usar la misma base de datos que en la búsqueda inicial para consistencia
         const COHORTS_DB_FOR_INFO = COHORTS_DB_FOR_EVALS_SEARCH || process.env.NOTION_DATABASE_ID || '';
         let additionalCohortIds: string[] = [];
-        
+
         // Combinar cohortes encontradas en búsqueda inicial con las que se encuentran ahora
         // Esto asegura que todas las cohortes del mentor se incluyan, incluso si no tienen evaluaciones
         const allKnownMentorCohortIds = new Set<string>();
-        
+
         // Agregar cohortes de la búsqueda inicial (si existen)
         allMentorCohortIdsFromSearch.forEach(id => allKnownMentorCohortIds.add(id));
-        
+
         // OPTIMIZACIÓN: Usar las cohortes ya encontradas en lugar de consultarlas de nuevo
         // Solo buscar información adicional si hay cohortes que no están en el cache
         if (COHORTS_DB_FOR_INFO) {
@@ -2230,12 +2251,12 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                 // Obtener IDs de cohortes del cache y de evaluaciones
                 const cachedCohortIds = Array.from(allMentorCohortPagesCache.keys());
                 const missingCohortIds = Array.from(allKnownMentorCohortIds).filter(id => !allMentorCohortPagesCache.has(id));
-                
+
                 // Si hay cohortes en el cache, usarlas directamente
                 if (cachedCohortIds.length > 0) {
                     cachedCohortIds.forEach(id => allKnownMentorCohortIds.add(id));
                 }
-                
+
                 // Solo buscar información adicional para cohortes que no están en el cache
                 if (missingCohortIds.length > 0) {
                     // Obtener información de las cohortes faltantes en paralelo
@@ -2255,19 +2276,19 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                 // Ignorar errores
             }
         }
-        
+
         // Agregar todas las cohortes conocidas del mentor que no están en las evaluaciones
         additionalCohortIds = Array.from(allKnownMentorCohortIds).filter(id => !cohortIdsFromEvaluations.includes(id));
-        
+
         // Combinar todas las cohortes
         const allCohortIds = [...cohortIdsFromEvaluations, ...additionalCohortIds];
-        
+
         // OPTIMIZACIÓN: Usar cache cuando sea posible, solo consultar las faltantes
         const cohortPagesToFetch = allCohortIds.filter(id => !allMentorCohortPagesCache.has(id));
         const cohortPagesFromCache = allCohortIds
             .filter(id => allMentorCohortPagesCache.has(id))
             .map(id => allMentorCohortPagesCache.get(id)!);
-        
+
         // Solo consultar las cohortes que no están en el cache
         const cohortPagesFetched = cohortPagesToFetch.length > 0 ? await Promise.all(
             cohortPagesToFetch.map(async (id) => {
@@ -2280,7 +2301,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                 }
             })
         ) : [];
-        
+
         // Combinar cache y consultas
         const cohortPages = [...cohortPagesFromCache, ...cohortPagesFetched];
 
@@ -2296,16 +2317,16 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
 
             const cohortId = cohortPage.id;
             const cohortData = byCohort.get(cohortId);
-            
+
             // Obtener estado de la cohorte - intentar diferentes nombres de campo
             const statusProp1 = (cohortPage as any).properties?.['Cohort Status ']?.select?.name;
             const statusProp2 = (cohortPage as any).properties?.['Cohort Status']?.select?.name;
             const statusProp3 = (cohortPage as any).properties?.Status?.select?.name;
             const status = statusProp1 || statusProp2 || statusProp3 || '';
-            
+
             const cohortName = (cohortPage as any).properties?.Cohort?.title?.[0]?.plain_text ||
-                              (cohortPage as any).properties?.Title?.title?.[0]?.plain_text ||
-                              'Cohorte sin nombre';
+                (cohortPage as any).properties?.Title?.title?.[0]?.plain_text ||
+                'Cohorte sin nombre';
 
             // Solo procesar cohortes con estados permitidos
             if (!allowedStatuses.includes(status)) {
@@ -2314,7 +2335,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
 
             // Si no hay datos de evaluaciones, crear estructura vacía para cohortes activas
             const items = cohortData?.items || [];
-            
+
             // Si es una cohorte activa sin evaluaciones, aún así mostrarla
             const isActive = status === 'Active' || status === 'Final Project';
             if (!cohortData && !isActive) {
@@ -2765,9 +2786,9 @@ app.put('/api/mentor-nps/evaluation-seen', authorizeTeachersOrAssistants(), asyn
 app.post('/api/mentors/test-assistant', async (req, res) => {
     try {
         const { email } = req.body;
-        
+
         if (!email) {
-            return res.status(400).json({ 
+            return res.status(400).json({
                 error: 'Se requiere email',
                 example: { email: 'torres_rominav@hotmail.com' }
             });
@@ -2779,7 +2800,7 @@ app.post('/api/mentors/test-assistant', async (req, res) => {
         const NPS_DB = process.env.NOTION_NPS_DATABASE_ID || '';
 
         if (!MENTORS_DB || !NPS_DB) {
-            return res.status(500).json({ 
+            return res.status(500).json({
                 error: 'Variables de entorno faltantes',
                 mentorsDb: !!MENTORS_DB,
                 npsDb: !!NPS_DB
@@ -2794,7 +2815,7 @@ app.post('/api/mentors/test-assistant', async (req, res) => {
         });
 
         if (!mentorQuery.results?.length) {
-            return res.status(404).json({ 
+            return res.status(404).json({
                 error: 'Mentor no encontrado',
                 email,
                 databaseId: MENTORS_DB
@@ -2813,7 +2834,7 @@ app.post('/api/mentors/test-assistant', async (req, res) => {
 
         // Paso 2: Probar diferentes filtros en la base de datos NPS
         console.log('🔍 [test-assistant] Paso 2: Probando filtros en base de datos NPS');
-        
+
         const filterTests = [
             {
                 name: 'Filtro T.A. con rollup (actual)',
@@ -2868,7 +2889,7 @@ app.post('/api/mentors/test-assistant', async (req, res) => {
         for (const test of filterTests) {
             try {
                 console.log(`🔍 [test-assistant] Probando: ${test.name}`);
-                
+
                 const queryResult = await notion.databases.query({
                     database_id: NPS_DB,
                     filter: test.filter as any
@@ -2927,7 +2948,7 @@ app.post('/api/mentors/test-assistant', async (req, res) => {
                 database_id: NPS_DB,
                 page_size: 100 // Limitar para no sobrecargar
             });
-            
+
             allEvaluations = allQuery.results?.slice(0, 10).map((page: any) => ({
                 id: page.id,
                 npsId: page.properties?.['NPS ID']?.title?.[0]?.plain_text || 'Sin ID',
@@ -2968,7 +2989,7 @@ app.post('/api/mentors/test-assistant', async (req, res) => {
         }
 
         if (allEvaluations.length > 0) {
-            const hasReferences = allEvaluations.some((evaluation:any) => evaluation.hasOurMentorId);
+            const hasReferences = allEvaluations.some((evaluation: any) => evaluation.hasOurMentorId);
             if (hasReferences) {
                 diagnosis.recommendations.push('🔍 Se encontraron referencias al mentorId en otras propiedades');
             } else {
@@ -2981,7 +3002,7 @@ app.post('/api/mentors/test-assistant', async (req, res) => {
         res.status(200).json(diagnosis);
     } catch (err: any) {
         console.error('❌ [test-assistant] Error:', err);
-        res.status(500).json({ 
+        res.status(500).json({
             error: 'Error en prueba de assistant',
             details: err.message
         });
@@ -2993,7 +3014,7 @@ app.post('/api/mentors/assistant-debug', authorizeTeachersOrAssistants(), async 
     try {
         const email = (req as any).user4GeeksData?.email;
         const userRoles = (req as any).user4GeeksData?.roles || [];
-        
+
         if (!email) {
             return res.status(400).json({ error: 'No se encontró email en el token' });
         }
@@ -3063,7 +3084,7 @@ app.post('/api/mentors/assistant-debug', authorizeTeachersOrAssistants(), async 
         for (const test of filterTests) {
             try {
                 console.log(`🔍 [assistant-debug] Probando: ${test.name}`);
-                
+
                 const queryResult = await notion.databases.query({
                     database_id: NPS_DB,
                     filter: test.filter as any
@@ -3142,7 +3163,7 @@ app.post('/api/mentors/assistant-debug', authorizeTeachersOrAssistants(), async 
         res.status(200).json(diagnosis);
     } catch (err: any) {
         console.error('❌ [assistant-debug] Error:', err);
-        res.status(500).json({ 
+        res.status(500).json({
             error: 'Error en diagnóstico de assistant',
             details: err.message
         });
@@ -3156,10 +3177,10 @@ app.post('/api/mentors/type-demo', authorizeTeachersOrAssistants(), async (req, 
 
         // ❌ PROBLEMA: Asignación directa sin validación de tipos
         let mentorIdProblematic = mentorIdFromBody;
-        
+
         // ✅ SOLUCIÓN: Procesamiento seguro de tipos
         let mentorIdSafe: string | undefined = undefined;
-        
+
         if (mentorIdFromBody !== undefined && mentorIdFromBody !== null) {
             if (typeof mentorIdFromBody === 'string') {
                 mentorIdSafe = mentorIdFromBody.trim();
@@ -3191,9 +3212,9 @@ app.post('/api/mentors/type-demo', authorizeTeachersOrAssistants(), async (req, 
                 isValidString: typeof mentorIdSafe === 'string',
                 isValidUUIDWithDashes: mentorIdSafe && typeof mentorIdSafe === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(mentorIdSafe),
                 isValidUUIDWithoutDashes: mentorIdSafe && typeof mentorIdSafe === 'string' && /^[a-f0-9]{32}$/i.test(mentorIdSafe),
-                isReadyForNotion: mentorIdSafe && typeof mentorIdSafe === 'string' && 
-                    (/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(mentorIdSafe) || 
-                     /^[a-f0-9]{32}$/i.test(mentorIdSafe))
+                isReadyForNotion: mentorIdSafe && typeof mentorIdSafe === 'string' &&
+                    (/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(mentorIdSafe) ||
+                        /^[a-f0-9]{32}$/i.test(mentorIdSafe))
             }
         };
 
@@ -3201,8 +3222,8 @@ app.post('/api/mentors/type-demo', authorizeTeachersOrAssistants(), async (req, 
         if (typeof mentorIdProblematic !== 'string') {
             demo.problematicAssignment.problems.push(`Tipo incorrecto: ${typeof mentorIdProblematic}`);
         }
-        if (mentorIdProblematic && typeof mentorIdProblematic === 'string' && 
-            !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(mentorIdProblematic) && 
+        if (mentorIdProblematic && typeof mentorIdProblematic === 'string' &&
+            !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(mentorIdProblematic) &&
             !/^[a-f0-9]{32}$/i.test(mentorIdProblematic)) {
             demo.problematicAssignment.problems.push('Formato UUID inválido (debe ser con o sin guiones)');
         }
@@ -3228,7 +3249,7 @@ app.post('/api/mentors/type-demo', authorizeTeachersOrAssistants(), async (req, 
 
     } catch (err: any) {
         console.error('❌ [type-demo] Error:', err);
-        res.status(500).json({ 
+        res.status(500).json({
             error: 'Error en demostración de tipos',
             details: err.message
         });
@@ -3252,7 +3273,7 @@ app.get('/api/mentors/mentor-id-info', authorizeTeachersOrAssistants(), async (r
 
         try {
             mentorId = await resolveMentorIdFromReq(req);
-            
+
             // Obtener información adicional del mentor
             const mentorPage = await notion.pages.retrieve({ page_id: mentorId });
             mentorInfo = {
@@ -3301,7 +3322,7 @@ app.get('/api/mentors/mentor-id-info', authorizeTeachersOrAssistants(), async (r
         res.status(200).json(response);
     } catch (err: any) {
         console.error('❌ [mentor-id-info] Error:', err);
-        res.status(500).json({ 
+        res.status(500).json({
             error: 'Error obteniendo información del mentorId',
             details: err.message
         });
@@ -3335,7 +3356,7 @@ app.post('/api/mentors/debug', authorizeTeachersOrAssistants(), async (req, res)
         // Intentar buscar el mentor
         let mentorResult = null;
         let mentorError = null;
-        
+
         try {
             mentorResult = await notion.databases.query({
                 database_id: MENTORS_DB,
@@ -3385,7 +3406,7 @@ app.post('/api/mentors/debug', authorizeTeachersOrAssistants(), async (req, res)
         res.status(200).json(diagnosis);
     } catch (err: any) {
         console.error('❌ [mentors/debug] Error en diagnóstico:', err);
-        res.status(500).json({ 
+        res.status(500).json({
             error: 'Error en diagnóstico de mentor',
             details: err.message
         });
@@ -3426,7 +3447,7 @@ app.get('/api/mentors/me', authorizeTeachersOrAssistants(), async (req, res) => 
             console.error('   - El nombre de la propiedad "Correo" es incorrecto');
             console.error('   - El formato del email no coincide exactamente');
             console.error('   - El mentor no está registrado en Notion');
-            return res.status(404).json({ 
+            return res.status(404).json({
                 error: 'Mentor no encontrado',
                 details: `No se encontró un mentor registrado con el email: ${email}`,
                 troubleshooting: {
@@ -3464,7 +3485,7 @@ app.get('/api/mentors/me', authorizeTeachersOrAssistants(), async (req, res) => 
             errorType: err.type,
             email: (req as any).user4GeeksData?.email
         });
-        res.status(500).json({ 
+        res.status(500).json({
             error: 'Error al consultar mentor',
             details: err.message
         });
@@ -3475,6 +3496,953 @@ function isISODateString(dateStr: string) {
     // Verifica si el string es un ISO 8601 válido (YYYY-MM-DDTHH:mm o similar)
     return typeof dateStr === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(dateStr);
 }
+
+/**
+ * Helper: Obtiene el nombre de un estudiante desde Notion usando su ID
+ */
+async function getStudentNameFromNotion(studentId: string): Promise<string> {
+    try {
+        const studentPage = await notion.pages.retrieve({
+            page_id: studentId
+        });
+
+        // Debug: Ver la estructura real de la página del estudiante
+        const properties = (studentPage as any).properties;
+        const propertyKeys = Object.keys(properties || {});
+
+        console.log(`🔍 [getStudentNameFromNotion] Estructura de estudiante ${studentId}:`, {
+            propertyKeys,
+            sampleProperties: propertyKeys.slice(0, 5).reduce((acc: any, key: string) => {
+                acc[key] = {
+                    type: properties[key]?.type,
+                    hasTitle: !!properties[key]?.title,
+                    hasRichText: !!properties[key]?.rich_text,
+                    titleValue: properties[key]?.title?.[0]?.plain_text || null
+                };
+                return acc;
+            }, {})
+        });
+
+        // El nombre del estudiante está en el campo "Student"
+        if (properties?.Student) {
+            const studentProp = properties.Student;
+
+            // Puede ser un campo title
+            if (studentProp?.type === 'title' && studentProp?.title?.[0]?.plain_text) {
+                const name = studentProp.title[0].plain_text.trim();
+                if (name) {
+                    return name;
+                }
+            }
+
+            // Puede ser un campo rich_text
+            if (studentProp?.type === 'rich_text' && studentProp?.rich_text?.[0]?.plain_text) {
+                const name = studentProp.rich_text[0].plain_text.trim();
+                if (name) {
+                    return name;
+                }
+            }
+
+            // Puede ser un campo formula que retorna texto
+            if (studentProp?.type === 'formula' && studentProp?.formula?.string) {
+                const name = studentProp.formula.string.trim();
+                if (name) {
+                    return name;
+                }
+            }
+        }
+
+        // Fallback: buscar en campos title (nombre principal de la página)
+        for (const key of propertyKeys) {
+            const prop = properties[key];
+            if (prop?.type === 'title' && prop?.title?.[0]?.plain_text) {
+                const name = prop.title[0].plain_text.trim();
+                if (name) {
+                    return name;
+                }
+            }
+        }
+
+        // Si no se encuentra, retornar desconocido
+        console.log(`⚠️ [getStudentNameFromNotion] No se pudo extraer nombre del estudiante ${studentId}`);
+        return 'Estudiante desconocido';
+    } catch (error: any) {
+        console.error(`⚠️ [getStudentNameFromNotion] Error obteniendo estudiante ${studentId}:`, error.message);
+        return 'Estudiante desconocido';
+    }
+}
+
+/**
+ * Helper: Obtiene nombres de estudiantes en batch para evitar consultas duplicadas
+ */
+async function getStudentNamesBatch(studentIds: string[]): Promise<Map<string, string>> {
+    const studentNamesMap = new Map<string, string>();
+    const uniqueIds = [...new Set(studentIds)];
+
+    // Hacer todas las consultas en paralelo
+    const promises = uniqueIds.map(async (id) => {
+        const name = await getStudentNameFromNotion(id);
+        return { id, name };
+    });
+
+    const results = await Promise.allSettled(promises);
+
+    results.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+            studentNamesMap.set(result.value.id, result.value.name);
+        } else {
+            studentNamesMap.set(uniqueIds[index], 'Estudiante desconocido');
+        }
+    });
+
+    return studentNamesMap;
+}
+
+/**
+ * Helper: Mapea el tipo de mentoría de Notion al tipo del sistema
+ */
+function mapMentorshipTypeFromNotion(notionType: string | null | undefined): 'Mock interview' | 'Mentoría' {
+    if (!notionType) return 'Mentoría';
+
+    const type = notionType.toLowerCase();
+    if (type === 'mock_interview') {
+        return 'Mock interview';
+    }
+    // mentorship, geek_force, geekForce → Mentoría
+    return 'Mentoría';
+}
+
+/**
+ * Helper: Consulta cancelaciones desde Notion con filtros
+ */
+async function fetchCancellationsFromNotion(
+    mentorName: string,
+    currentPeriod: { start: Date; end: Date },
+    previousPeriod: { start: Date; end: Date }
+): Promise<any[]> {
+    const CANCELLATIONS_DB = process.env.NOTION_CANCELLATIONS_DATABASE_ID || '';
+
+    if (!CANCELLATIONS_DB) {
+        throw new Error('NOTION_CANCELLATIONS_DATABASE_ID no está configurado en variables de entorno');
+    }
+
+    // Extraer apellido del nombre completo (última palabra)
+    const nameParts = mentorName.trim().split(/\s+/);
+    const lastName = nameParts.length > 1 ? nameParts[nameParts.length - 1] : mentorName;
+
+    // Formatear fechas para Notion (ISO string sin tiempo para dates)
+    const formatDateForNotion = (date: Date): string => {
+        return date.toISOString().split('T')[0];
+    };
+
+    // Crear filtros para cada periodo
+    // Nota: Los campos select en Notion solo soportan 'equals' exacto
+    // Usamos OR para buscar por nombre completo o apellido
+    const mentorshipTypeFilter = {
+        or: [
+            { property: 'Tipo de mentoría', select: { equals: 'mock_interview' } },
+            { property: 'Tipo de mentoría', select: { equals: 'mentorship' } },
+            { property: 'Tipo de mentoría', select: { equals: 'geek_force' } },
+            { property: 'Tipo de mentoría', select: { equals: 'geekForce' } }
+        ]
+    };
+
+    const currentPeriodFilter = {
+        and: [
+            {
+                or: [
+                    { property: 'Mentor/a', select: { equals: mentorName } },
+                    { property: 'Mentor/a', select: { equals: lastName } }
+                ]
+            },
+            {
+                property: 'Fecha y hora de mentoría',
+                date: {
+                    on_or_after: formatDateForNotion(currentPeriod.start)
+                }
+            },
+            {
+                property: 'Fecha y hora de mentoría',
+                date: {
+                    on_or_before: formatDateForNotion(currentPeriod.end)
+                }
+            },
+            mentorshipTypeFilter
+        ]
+    };
+
+    const previousPeriodFilter = {
+        and: [
+            {
+                or: [
+                    { property: 'Mentor/a', select: { equals: mentorName } },
+                    { property: 'Mentor/a', select: { equals: lastName } }
+                ]
+            },
+            {
+                property: 'Fecha y hora de mentoría',
+                date: {
+                    on_or_after: formatDateForNotion(previousPeriod.start)
+                }
+            },
+            {
+                property: 'Fecha y hora de mentoría',
+                date: {
+                    on_or_before: formatDateForNotion(previousPeriod.end)
+                }
+            },
+            mentorshipTypeFilter
+        ]
+    };
+
+    // Consultar ambos periodos en paralelo
+    const allResults: any[] = [];
+
+    try {
+        const [currentResults, previousResults] = await Promise.all([
+            notionQueryAll(CANCELLATIONS_DB, currentPeriodFilter).catch(() => []),
+            notionQueryAll(CANCELLATIONS_DB, previousPeriodFilter).catch(() => [])
+        ]);
+
+        allResults.push(...currentResults, ...previousResults);
+    } catch (error: any) {
+        console.error('❌ [fetchCancellationsFromNotion] Error consultando Notion:', error.message);
+        throw error;
+    }
+
+    // Eliminar duplicados por ID
+    const uniqueResults = Array.from(
+        new Map(allResults.map(item => [item.id, item])).values()
+    );
+
+    return uniqueResults;
+}
+
+/**
+ * Helper: Busca un estudiante en Notion por nombre
+ */
+async function findStudentIdByName(studentName: string): Promise<string | null> {
+    try {
+        const STUDENTS_DB = process.env.NOTION_STD_DATABASE_ID || process.env.NOTION_STUDENTS_DATABASE_ID || '';
+
+        if (!STUDENTS_DB) {
+            console.error('⚠️ [findStudentIdByName] No se encontró NOTION_STD_DATABASE_ID o NOTION_STUDENTS_DATABASE_ID');
+            return null;
+        }
+
+        // Buscar por campo "Student" que contenga el nombre
+        const response = await notion.databases.query({
+            database_id: STUDENTS_DB,
+            filter: {
+                or: [
+                    {
+                        property: 'Student',
+                        title: {
+                            contains: studentName
+                        }
+                    },
+                    {
+                        property: 'Name',
+                        title: {
+                            contains: studentName
+                        }
+                    },
+                    {
+                        property: 'Nombre',
+                        title: {
+                            contains: studentName
+                        }
+                    }
+                ]
+            }
+        });
+
+        if (response.results && response.results.length > 0) {
+            // Retornar el primer resultado encontrado
+            return response.results[0].id;
+        }
+
+        return null;
+    } catch (error: any) {
+        console.error('❌ [findStudentIdByName] Error buscando estudiante:', error.message);
+        return null;
+    }
+}
+
+/**
+ * Helper: Busca una cancelación existente en Notion por fecha de mentoría y estudiante
+ */
+async function findExistingCancellation(mentorshipDate: Date, studentId: string): Promise<string | null> {
+    try {
+        const CANCELLATIONS_DB = process.env.NOTION_CANCELLATIONS_DATABASE_ID || '';
+
+        if (!CANCELLATIONS_DB) {
+            throw new Error('NOTION_CANCELLATIONS_DATABASE_ID no está configurado');
+        }
+
+        // Formatear fecha para Notion (solo fecha, sin hora)
+        const formatDateForNotion = (date: Date): string => {
+            return date.toISOString().split('T')[0];
+        };
+
+        const dateStr = formatDateForNotion(mentorshipDate);
+
+        // Buscar cancelación por fecha de mentoría y estudiante
+        const response = await notion.databases.query({
+            database_id: CANCELLATIONS_DB,
+            filter: {
+                and: [
+                    {
+                        property: 'Fecha y hora de mentoría',
+                        date: {
+                            equals: dateStr
+                        }
+                    },
+                    {
+                        property: 'Estudiante',
+                        relation: {
+                            contains: studentId
+                        }
+                    }
+                ]
+            }
+        });
+
+        if (response.results && response.results.length > 0) {
+            return response.results[0].id;
+        }
+
+        return null;
+    } catch (error: any) {
+        console.error('❌ [findExistingCancellation] Error buscando cancelación:', error.message);
+        return null;
+    }
+}
+
+/**
+ * Helper: Formatea la información de la mentorship en texto estructurado para las notas
+ */
+function formatMentorshipNotes(mentorshipData: {
+    student: string;
+    startTime: string;
+    endTime: string;
+    duration: number;
+    status: string;
+    service: string;
+}): string {
+    const formatDateTime = (isoString: string): string => {
+        if (!isoString) return 'No especificada';
+        try {
+            const date = new Date(isoString);
+            return date.toLocaleString('es-ES', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+        } catch {
+            return isoString;
+        }
+    };
+
+    const notes = [
+        `Nombre de alumno: ${mentorshipData.student}`,
+        `Hora de comienzo: ${formatDateTime(mentorshipData.startTime)}`,
+        `Hora de finalización: ${mentorshipData.endTime ? formatDateTime(mentorshipData.endTime) : 'No finalizada'}`,
+        `Duración: ${mentorshipData.duration} minutos`,
+        `Estado: ${mentorshipData.status}`,
+        `Servicio: ${mentorshipData.service}`
+    ].join('\n');
+
+    return notes;
+}
+
+/**
+ * Helper: Mapea el tipo de servicio del sistema a valores de Notion
+ */
+function mapServiceToNotionType(service: 'Mock interview' | 'Mentoría'): string {
+    if (service === 'Mock interview') {
+        return 'mock_interview';
+    }
+    // Por defecto, usar "mentorship" para Mentoría
+    // Nota: Si hay lógica de negocio para distinguir entre mentorship, geek_force, geekForce, agregarla aquí
+    return 'mentorship';
+}
+
+/**
+ * Helper: Actualiza una cancelación existente marcando "Ask for revision"
+ */
+async function updateCancellationReviewRequest(pageId: string, notes: string): Promise<void> {
+    try {
+        await notion.pages.update({
+            page_id: pageId,
+            properties: {
+                'Ask for revision': {
+                    checkbox: true
+                },
+                'Motivo de reprogramación': {
+                    select: {
+                        name: 'Solicitud de revisión'
+                    }
+                },
+                'Notas': {
+                    rich_text: [{
+                        text: {
+                            content: notes
+                        }
+                    }]
+                }
+            }
+        });
+    } catch (error: any) {
+        console.error('❌ [updateCancellationReviewRequest] Error actualizando cancelación:', error.message);
+        throw error;
+    }
+}
+
+/**
+ * Helper: Crea una nueva cancelación en Notion para solicitud de revisión
+ */
+async function createCancellationForReview(
+    mentorshipData: {
+        studentId: string;
+        startTime: string;
+        endTime: string;
+        duration: number;
+        status: string;
+        service: string;
+        student: string;
+    },
+    mentorName: string
+): Promise<string> {
+    try {
+        const CANCELLATIONS_DB = process.env.NOTION_CANCELLATIONS_DATABASE_ID || '';
+
+        if (!CANCELLATIONS_DB) {
+            throw new Error('NOTION_CANCELLATIONS_DATABASE_ID no está configurado');
+        }
+
+        // Formatear notas
+        const notes = formatMentorshipNotes({
+            student: mentorshipData.student,
+            startTime: mentorshipData.startTime,
+            endTime: mentorshipData.endTime,
+            duration: mentorshipData.duration,
+            status: mentorshipData.status,
+            service: mentorshipData.service
+        });
+
+        // Formatear fecha de mentoría (solo fecha para Notion)
+        const mentorshipDate = new Date(mentorshipData.startTime);
+        const mentorshipDateStr = mentorshipDate.toISOString().split('T')[0];
+
+        // Fecha actual para cancelación
+        const cancellationDate = new Date();
+        const cancellationDateStr = cancellationDate.toISOString();
+
+        // Mapear tipo de servicio
+        const serviceType = mapServiceToNotionType(mentorshipData.service as 'Mock interview' | 'Mentoría');
+
+        const response = await notion.pages.create({
+            parent: {
+                database_id: CANCELLATIONS_DB
+            },
+            properties: {
+                'Estudiante': {
+                    relation: [{
+                        id: mentorshipData.studentId
+                    }]
+                },
+                'Fecha y hora de mentoría': {
+                    date: {
+                        start: mentorshipDateStr
+                    }
+                },
+                'Fecha y hora de cancelación': {
+                    date: {
+                        start: cancellationDateStr
+                    }
+                },
+                'Mentor/a': {
+                    select: {
+                        name: mentorName
+                    }
+                },
+                'Motivo de reprogramación': {
+                    select: {
+                        name: 'Solicitud de revisión'
+                    }
+                },
+                'Tipo de mentoría': {
+                    select: {
+                        name: serviceType
+                    }
+                },
+                'Ask for revision': {
+                    checkbox: true
+                },
+                'Suplido con otro alumno': {
+                    checkbox: false
+                },
+                'Notas': {
+                    rich_text: [{
+                        text: {
+                            content: notes
+                        }
+                    }]
+                }
+            }
+        });
+
+        return response.id;
+    } catch (error: any) {
+        console.error('❌ [createCancellationForReview] Error creando cancelación:', error.message);
+        throw error;
+    }
+}
+
+// Endpoint para obtener las mentorías del mentor autenticado
+app.get('/api/mentor/my-mentorships', authMiddleware, async (req, res) => {
+    try {
+        // Obtener y validar query parameter periodType
+        const periodType = (req.query.periodType as string) || 'academic';
+        if (periodType !== 'academic' && periodType !== 'monthly') {
+            return res.status(400).json({
+                error: 'periodType debe ser "academic" o "monthly"'
+            });
+        }
+
+        // Obtener token del header Authorization (el middleware ya validó que existe)
+        const authHeader = req.headers['authorization'] as string;
+        const token = authHeader.split(' ')[1];
+
+        // Obtener Academy ID (por defecto 6, según el plan)
+        const academyId = process.env.API_ACADEMY || '6';
+
+        // Obtener nombre del mentor
+        const userData = (req as any).user4GeeksData;
+        const mentorName = userData?.first_name && userData?.last_name
+            ? `${userData.first_name} ${userData.last_name}`
+            : userData?.username || 'Mentor';
+
+        // Obtener mentorías del API
+        const sessions = await fetchMentorSessions(token, academyId);
+
+        // Calcular fechas de periodos según el tipo seleccionado
+        const currentPeriod = periodType === 'monthly'
+            ? getCurrentMonthlyPeriodDates()
+            : getCurrentPeriodDates();
+        const previousPeriod = periodType === 'monthly'
+            ? getPreviousMonthlyPeriodDates()
+            : getPreviousPeriodDates();
+
+        // Procesar mentorías
+        const processedMentorships: ProcessedMentorship[] = [];
+
+        sessions.forEach((session: any) => {
+            // Obtener fecha de inicio (requerida)
+            const startTime = getMentorshipStartTime(session);
+            if (!startTime) {
+                // Excluir mentorías sin fecha de inicio
+                return;
+            }
+
+            // Determinar a qué periodo pertenece
+            let period: 'current' | 'previous' | null = null;
+            if (startTime >= currentPeriod.start && startTime <= currentPeriod.end) {
+                period = 'current';
+            } else if (startTime >= previousPeriod.start && startTime <= previousPeriod.end) {
+                period = 'previous';
+            } else {
+                // Fuera de los periodos de interés, excluir
+                return;
+            }
+
+            // Obtener fecha de fin
+            const endTime = getMentorshipEndTime(session);
+
+            // Calcular duración
+            let duration = 0;
+            if (endTime) {
+                duration = calculateDuration(startTime, endTime);
+            }
+
+            // Determinar tipo de servicio usando la función helper
+            const serviceName = getServiceName(session);
+            const service = determineServiceType(serviceName);
+
+            // Calcular status
+            const status = calculateMentorshipStatus(session);
+
+            // Determinar canRequestReview (false si se paga, true si no)
+            const canRequestReview = status === 'No corresponde' || status === 'No realizada';
+
+            // Obtener nombre del estudiante
+            const student = getStudentName(session);
+
+            // Agregar mentoría procesada
+            processedMentorships.push({
+                id: String(session.id),
+                student,
+                service,
+                startTime: startTime.toISOString(),
+                endTime: endTime ? endTime.toISOString() : '',
+                duration,
+                status,
+                canRequestReview,
+                period,
+            });
+        });
+
+        // Generar resúmenes mensuales
+        const monthlySummaries = generateMonthlySummaries(
+            processedMentorships,
+            currentPeriod,
+            previousPeriod
+        );
+
+        // Retornar respuesta en el formato esperado
+        res.status(200).json({
+            mentorName,
+            mentorships: processedMentorships.map((m) => ({
+                id: m.id,
+                student: m.student,
+                service: m.service,
+                startTime: m.startTime,
+                endTime: m.endTime,
+                duration: m.duration,
+                status: m.status,
+                canRequestReview: m.canRequestReview,
+            })),
+            monthlySummaries,
+        });
+    } catch (error: any) {
+        console.error('❌ [mentor/my-mentorships] Error:', {
+            error: error.message,
+            stack: error.stack,
+        });
+        res.status(500).json({
+            error: 'Error al obtener mentorías',
+            details: error.message,
+        });
+    }
+});
+
+// Endpoint para obtener las mentorías canceladas del mentor autenticado
+app.get('/api/mentor/cancelled-mentorships', authMiddleware, async (req, res) => {
+    try {
+        // Obtener y validar query parameter periodType
+        const periodType = (req.query.periodType as string) || 'academic';
+        if (periodType !== 'academic' && periodType !== 'monthly') {
+            return res.status(400).json({
+                error: 'periodType debe ser "academic" o "monthly"'
+            });
+        }
+
+        // Obtener nombre del mentor
+        const userData = (req as any).user4GeeksData;
+        const mentorName = userData?.first_name && userData?.last_name
+            ? `${userData.first_name} ${userData.last_name}`
+            : userData?.username || 'Mentor';
+
+        // Calcular fechas de periodos según el tipo seleccionado
+        const currentPeriod = periodType === 'monthly'
+            ? getCurrentMonthlyPeriodDates()
+            : getCurrentPeriodDates();
+        const previousPeriod = periodType === 'monthly'
+            ? getPreviousMonthlyPeriodDates()
+            : getPreviousPeriodDates();
+
+        // Obtener cancelaciones desde Notion
+        const cancellations = await fetchCancellationsFromNotion(
+            mentorName,
+            currentPeriod,
+            previousPeriod
+        );
+
+        // Extraer todos los IDs de estudiantes únicos
+        const studentIds: string[] = [];
+        cancellations.forEach((cancellation: any) => {
+            const studentRelation = cancellation.properties?.['Estudiante']?.relation;
+            if (studentRelation && Array.isArray(studentRelation) && studentRelation.length > 0) {
+                studentIds.push(studentRelation[0].id);
+            }
+        });
+
+        // Obtener nombres de estudiantes en batch
+        const studentNamesMap = await getStudentNamesBatch(studentIds);
+
+        // Procesar cancelaciones
+        const processedCancellations: any[] = [];
+
+        cancellations.forEach((cancellation: any) => {
+            const properties = cancellation.properties || {};
+
+            // Extraer fecha de mentoría
+            const mentorshipDateProp = properties['Fecha y hora de mentoría']?.date;
+            if (!mentorshipDateProp?.start) {
+                console.log(`⚠️ [cancelled-mentorships] Cancelación ${cancellation.id} excluida: sin fecha de mentoría`);
+                return;
+            }
+
+            const mentorshipDate = new Date(mentorshipDateProp.start);
+
+            // Determinar a qué periodo pertenece
+            let period: 'current' | 'previous' | null = null;
+            if (mentorshipDate >= currentPeriod.start && mentorshipDate <= currentPeriod.end) {
+                period = 'current';
+            } else if (mentorshipDate >= previousPeriod.start && mentorshipDate <= previousPeriod.end) {
+                period = 'previous';
+            } else {
+                // Fuera de los periodos de interés, excluir
+                return;
+            }
+
+            // Extraer estudiante
+            const studentRelation = properties['Estudiante']?.relation;
+            const studentId = studentRelation && Array.isArray(studentRelation) && studentRelation.length > 0
+                ? studentRelation[0].id
+                : null;
+            const student = studentId ? studentNamesMap.get(studentId) || 'Estudiante desconocido' : 'Estudiante desconocido';
+
+            // Extraer tipo de mentoría
+            const mentorshipType = properties['Tipo de mentoría']?.select?.name || null;
+            const service = mapMentorshipTypeFromNotion(mentorshipType);
+
+            // Extraer fecha de cancelación
+            const cancellationDateProp = properties['Fecha y hora de cancelación']?.date;
+            const cancellationDate = cancellationDateProp?.start
+                ? new Date(cancellationDateProp.start).toISOString()
+                : '';
+
+            // Extraer motivo de reprogramación
+            const cancellationReason = properties['Motivo de reprogramación']?.select?.name || '';
+
+            // Extraer notas
+            const notesProp = properties['Notas']?.rich_text;
+            const notes = notesProp && Array.isArray(notesProp) && notesProp.length > 0
+                ? notesProp.map((text: any) => text.plain_text || '').join(' ')
+                : '';
+
+            // Extraer status (campo fórmula)
+            const statusProp = properties['Status'];
+            let status: 'A pagar' | 'No corresponde' = 'No corresponde';
+
+            // El campo Status es una fórmula, puede venir como formula, rich_text, o select
+            if (statusProp?.formula?.string) {
+                const statusValue = statusProp.formula.string;
+                status = statusValue === 'A pagar' ? 'A pagar' : 'No corresponde';
+            } else if (statusProp?.formula?.boolean !== undefined) {
+                status = statusProp.formula.boolean ? 'A pagar' : 'No corresponde';
+            } else if (statusProp?.rich_text?.[0]?.plain_text) {
+                const statusValue = statusProp.rich_text[0].plain_text;
+                status = statusValue === 'A pagar' ? 'A pagar' : 'No corresponde';
+            } else if (statusProp?.select?.name) {
+                const statusValue = statusProp.select.name;
+                status = statusValue === 'A pagar' ? 'A pagar' : 'No corresponde';
+            }
+
+            // Determinar canRequestReview (false si se paga, true si no)
+            const canRequestReview = status === 'No corresponde';
+
+            // Agregar cancelación procesada
+            processedCancellations.push({
+                id: cancellation.id,
+                student,
+                service,
+                cancellationDate,
+                mentorshipDate: mentorshipDate.toISOString(),
+                cancellationReason,
+                notes,
+                status,
+                period,
+                canRequestReview,
+            });
+        });
+
+        // Retornar respuesta en el formato esperado
+        res.status(200).json({
+            mentorName,
+            cancelledMentorships: processedCancellations,
+        });
+    } catch (error: any) {
+        console.error('❌ [mentor/cancelled-mentorships] Error:', {
+            error: error.message,
+            stack: error.stack,
+        });
+        res.status(500).json({
+            error: 'Error al obtener mentorías canceladas',
+            details: error.message,
+        });
+    }
+});
+
+// Endpoint para solicitar revisión de una mentoría
+app.post('/api/mentor/request-review', authMiddleware, async (req, res) => {
+    try {
+        const {
+            cancellationId,
+            mentorshipId,
+            student,
+            studentId,
+            service,
+            startTime,
+            endTime,
+            duration,
+            status
+        } = req.body;
+
+        // Validaciones
+        if (!mentorshipId) {
+            return res.status(400).json({ error: 'mentorshipId es requerido' });
+        }
+        if (!student) {
+            return res.status(400).json({ error: 'student es requerido' });
+        }
+        if (!startTime) {
+            return res.status(400).json({ error: 'startTime es requerido' });
+        }
+        if (!service) {
+            return res.status(400).json({ error: 'service es requerido' });
+        }
+
+        // Normalizar el servicio (case-insensitive y manejar variaciones)
+        const normalizedService = service.trim();
+        const serviceLower = normalizedService.toLowerCase();
+
+        let finalService: 'Mock interview' | 'Mentoría';
+        if (serviceLower === 'mock interview' || serviceLower === 'mock_interview') {
+            finalService = 'Mock interview';
+        } else if (serviceLower === 'mentoría' || serviceLower === 'mentoria' || serviceLower === 'mentorship') {
+            finalService = 'Mentoría';
+        } else {
+            return res.status(400).json({
+                error: 'service debe ser "Mock interview" o "Mentoría"',
+                received: service
+            });
+        }
+
+        // Validar formato de fecha ISO
+        if (!isISODateString(startTime)) {
+            return res.status(400).json({ error: 'startTime debe ser una fecha ISO válida' });
+        }
+        if (endTime && !isISODateString(endTime)) {
+            return res.status(400).json({ error: 'endTime debe ser una fecha ISO válida' });
+        }
+
+        // Obtener nombre del mentor
+        const userData = (req as any).user4GeeksData;
+        const mentorName = userData?.first_name && userData?.last_name
+            ? `${userData.first_name} ${userData.last_name}`
+            : userData?.username || 'Mentor';
+
+        // Buscar cancelación existente y obtener studentId
+        let cancellationPageId: string | null = null;
+        let wasCreated = false;
+        let finalStudentId: string | null = null;
+
+        if (cancellationId) {
+            // Si se envía cancellationId, obtener la página directamente y extraer studentId
+            try {
+                const cancellationPage = await notion.pages.retrieve({ page_id: cancellationId });
+                cancellationPageId = cancellationId;
+
+                // Extraer studentId de la cancelación existente
+                const properties = (cancellationPage as any).properties || {};
+                const studentRelation = properties['Estudiante']?.relation;
+                if (studentRelation && Array.isArray(studentRelation) && studentRelation.length > 0) {
+                    finalStudentId = studentRelation[0].id;
+                    console.log(`✅ [request-review] StudentId extraído de cancelación existente: ${finalStudentId}`);
+                }
+            } catch (error: any) {
+                if (error.code === 'object_not_found') {
+                    // La página no existe, continuar para crear nueva
+                    console.log(`⚠️ [request-review] Cancelación ${cancellationId} no encontrada, se creará nueva`);
+                } else {
+                    throw error;
+                }
+            }
+        }
+
+        // Si no se obtuvo studentId de la cancelación, intentar obtenerlo de otras fuentes
+        if (!finalStudentId) {
+            if (studentId) {
+                finalStudentId = studentId;
+            } else {
+                // Buscar estudiante por nombre (solo si no tenemos cancellationId o studentId)
+                if (!cancellationId) {
+                    finalStudentId = await findStudentIdByName(student);
+                    if (!finalStudentId) {
+                        return res.status(400).json({
+                            error: 'No se pudo encontrar el estudiante en Notion',
+                            details: `No se encontró un estudiante con el nombre "${student}". Por favor, proporciona el studentId.`
+                        });
+                    }
+                } else {
+                    // Si tenemos cancellationId pero no pudimos extraer studentId, es un error
+                    return res.status(400).json({
+                        error: 'No se pudo obtener el estudiante de la cancelación',
+                        details: 'La cancelación existe pero no tiene un estudiante asociado. Por favor, proporciona el studentId.'
+                    });
+                }
+            }
+        }
+
+        // Si no se encontró cancelación por ID, buscar por fecha y estudiante
+        if (!cancellationPageId) {
+            const mentorshipDate = new Date(startTime);
+            cancellationPageId = await findExistingCancellation(mentorshipDate, finalStudentId);
+        }
+
+        // Formatear notas
+        const notes = formatMentorshipNotes({
+            student,
+            startTime,
+            endTime: endTime || '',
+            duration: duration || 0,
+            status: status || '',
+            service: finalService
+        });
+
+        // Actualizar o crear cancelación
+        if (cancellationPageId) {
+            // Actualizar cancelación existente
+            await updateCancellationReviewRequest(cancellationPageId, notes);
+            console.log(`✅ [request-review] Cancelación ${cancellationPageId} actualizada`);
+        } else {
+            // Crear nueva cancelación
+            cancellationPageId = await createCancellationForReview({
+                studentId: finalStudentId,
+                startTime,
+                endTime: endTime || '',
+                duration: duration || 0,
+                status: status || '',
+                service: finalService,
+                student
+            }, mentorName);
+            wasCreated = true;
+            console.log(`✅ [request-review] Nueva cancelación ${cancellationPageId} creada`);
+        }
+
+        // Retornar respuesta
+        res.status(200).json({
+            success: true,
+            message: 'Solicitud de revisión registrada correctamente',
+            cancellationId: cancellationPageId,
+            created: wasCreated
+        });
+    } catch (error: any) {
+        console.error('❌ [mentor/request-review] Error:', {
+            error: error.message,
+            stack: error.stack,
+        });
+        res.status(500).json({
+            error: 'Error al procesar solicitud de revisión',
+            details: error.message,
+        });
+    }
+});
 
 // Endpoint de prueba para verificar que el servidor funciona
 app.get('/api/health', (req, res) => {
