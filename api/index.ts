@@ -3872,26 +3872,15 @@ function mapServiceToNotionType(service: 'Mock interview' | 'Mentoría'): string
 
 /**
  * Helper: Actualiza una cancelación existente marcando "Ask for revision"
+ * Nota: No modifica las notas ni el motivo existentes, solo marca el checkbox
  */
-async function updateCancellationReviewRequest(pageId: string, notes: string): Promise<void> {
+async function updateCancellationReviewRequest(pageId: string): Promise<void> {
     try {
         await notion.pages.update({
             page_id: pageId,
             properties: {
                 'Ask for revision': {
                     checkbox: true
-                },
-                'Motivo de reprogramación': {
-                    select: {
-                        name: 'Solicitud de revisión'
-                    }
-                },
-                'Notas': {
-                    rich_text: [{
-                        text: {
-                            content: notes
-                        }
-                    }]
                 }
             }
         });
@@ -3906,7 +3895,7 @@ async function updateCancellationReviewRequest(pageId: string, notes: string): P
  */
 async function createCancellationForReview(
     mentorshipData: {
-        studentId: string;
+        studentId: string | null;
         startTime: string;
         endTime: string;
         duration: number;
@@ -3944,55 +3933,62 @@ async function createCancellationForReview(
         // Mapear tipo de servicio
         const serviceType = mapServiceToNotionType(mentorshipData.service as 'Mock interview' | 'Mentoría');
 
+        // Construir propiedades base
+        const properties: any = {
+            'Fecha y hora de mentoría': {
+                date: {
+                    start: mentorshipDateStr
+                }
+            },
+            'Fecha y hora de cancelación': {
+                date: {
+                    start: cancellationDateStr
+                }
+            },
+            'Mentor/a': {
+                select: {
+                    name: mentorName
+                }
+            },
+            'Motivo de reprogramación': {
+                select: {
+                    name: 'Solicitud de revisión'
+                }
+            },
+            'Tipo de mentoría': {
+                select: {
+                    name: serviceType
+                }
+            },
+            'Ask for revision': {
+                checkbox: true
+            },
+            'Suplido con otro alumno': {
+                checkbox: false
+            },
+            'Notas': {
+                rich_text: [{
+                    text: {
+                        content: notes
+                    }
+                }]
+            }
+        };
+
+        // Solo agregar relación de estudiante si tenemos studentId
+        if (mentorshipData.studentId) {
+            properties['Estudiante'] = {
+                relation: [{
+                    id: mentorshipData.studentId
+                }]
+            };
+        }
+
         const response = await notion.pages.create({
             parent: {
                 database_id: CANCELLATIONS_DB
             },
-            properties: {
-                'Estudiante': {
-                    relation: [{
-                        id: mentorshipData.studentId
-                    }]
-                },
-                'Fecha y hora de mentoría': {
-                    date: {
-                        start: mentorshipDateStr
-                    }
-                },
-                'Fecha y hora de cancelación': {
-                    date: {
-                        start: cancellationDateStr
-                    }
-                },
-                'Mentor/a': {
-                    select: {
-                        name: mentorName
-                    }
-                },
-                'Motivo de reprogramación': {
-                    select: {
-                        name: 'Solicitud de revisión'
-                    }
-                },
-                'Tipo de mentoría': {
-                    select: {
-                        name: serviceType
-                    }
-                },
-                'Ask for revision': {
-                    checkbox: true
-                },
-                'Suplido con otro alumno': {
-                    checkbox: false
-                },
-                'Notas': {
-                    rich_text: [{
-                        text: {
-                            content: notes
-                        }
-                    }]
-                }
-            }
+            properties
         });
 
         return response.id;
@@ -4370,48 +4366,44 @@ app.post('/api/mentor/request-review', authMiddleware, async (req, res) => {
             if (studentId) {
                 finalStudentId = studentId;
             } else {
-                // Buscar estudiante por nombre (solo si no tenemos cancellationId o studentId)
+                // Buscar estudiante por nombre (solo si no tenemos cancellationId)
                 if (!cancellationId) {
                     finalStudentId = await findStudentIdByName(student);
                     if (!finalStudentId) {
-                        return res.status(400).json({
-                            error: 'No se pudo encontrar el estudiante en Notion',
-                            details: `No se encontró un estudiante con el nombre "${student}". Por favor, proporciona el studentId.`
-                        });
+                        // Si no se encuentra el estudiante, continuar sin studentId
+                        // El nombre del estudiante estará en las notas
+                        console.log(`⚠️ [request-review] Estudiante "${student}" no encontrado en Notion. Se creará cancelación sin relación de estudiante.`);
                     }
                 } else {
-                    // Si tenemos cancellationId pero no pudimos extraer studentId, es un error
-                    return res.status(400).json({
-                        error: 'No se pudo obtener el estudiante de la cancelación',
-                        details: 'La cancelación existe pero no tiene un estudiante asociado. Por favor, proporciona el studentId.'
-                    });
+                    // Si tenemos cancellationId pero no pudimos extraer studentId, continuar sin él
+                    // El nombre del estudiante estará en las notas
+                    console.log(`⚠️ [request-review] Cancelación ${cancellationId} no tiene estudiante asociado. Se actualizará sin relación de estudiante.`);
                 }
             }
         }
 
-        // Si no se encontró cancelación por ID, buscar por fecha y estudiante
-        if (!cancellationPageId) {
+        // Si no se encontró cancelación por ID, buscar por fecha y estudiante (solo si tenemos studentId)
+        if (!cancellationPageId && finalStudentId) {
             const mentorshipDate = new Date(startTime);
             cancellationPageId = await findExistingCancellation(mentorshipDate, finalStudentId);
         }
 
-        // Formatear notas
-        const notes = formatMentorshipNotes({
-            student,
-            startTime,
-            endTime: endTime || '',
-            duration: duration || 0,
-            status: status || '',
-            service: finalService
-        });
-
         // Actualizar o crear cancelación
         if (cancellationPageId) {
-            // Actualizar cancelación existente
-            await updateCancellationReviewRequest(cancellationPageId, notes);
-            console.log(`✅ [request-review] Cancelación ${cancellationPageId} actualizada`);
+            // Actualizar cancelación existente (solo checkbox, sin modificar notas ni motivo)
+            await updateCancellationReviewRequest(cancellationPageId);
+            console.log(`✅ [request-review] Cancelación ${cancellationPageId} actualizada (solo checkbox)`);
         } else {
-            // Crear nueva cancelación
+            // Crear nueva cancelación con toda la información incluyendo notas
+            const notes = formatMentorshipNotes({
+                student,
+                startTime,
+                endTime: endTime || '',
+                duration: duration || 0,
+                status: status || '',
+                service: finalService
+            });
+
             cancellationPageId = await createCancellationForReview({
                 studentId: finalStudentId,
                 startTime,
@@ -4422,7 +4414,7 @@ app.post('/api/mentor/request-review', authMiddleware, async (req, res) => {
                 student
             }, mentorName);
             wasCreated = true;
-            console.log(`✅ [request-review] Nueva cancelación ${cancellationPageId} creada`);
+            console.log(`✅ [request-review] Nueva cancelación ${cancellationPageId} creada con toda la información`);
         }
 
         // Retornar respuesta

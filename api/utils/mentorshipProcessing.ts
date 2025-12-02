@@ -6,10 +6,10 @@ import { calcularHorasPagas, MOCK_SERVICE } from './calculoHoras.js';
 
 // Servicios pagados (basado en mentorshipCount.js)
 export const PAID_SERVICES = [
-  'Full-Stack: Ejercicios',
-  'Data Science: Ejercicios',
-  'Full-Stack: Proyectos Finales',
-  'Ciberseguridad: Ejercicios',
+    'Full-Stack: Ejercicios',
+    'Data Science: Ejercicios',
+    'Full-Stack: Proyectos Finales',
+    'Ciberseguridad: Ejercicios',
 ];
 
 export type MentorshipStatus = 'A pagar' | 'No corresponde' | 'No realizada' | 'No realizada a pagar';
@@ -20,59 +20,59 @@ export type ServiceType = 'Mock interview' | 'Mentoría';
  * Nota: El API puede retornar diferentes estructuras, por lo que usamos 'any' para flexibilidad
  */
 export interface MentorshipSession {
-  id: number;
-  status: string;
-  summary?: string | null;
-  started_at?: string | null;
-  mentor_joined_at?: string | null;
-  ended_at?: string | null;
-  mentee_left_at?: string | null;
-  service?: {
-    name?: string;
-    slug?: string;
-  } | null;
-  service_name?: string; // Campo alternativo que puede venir directamente
-  service_slug?: string; // Campo alternativo
-  mentor?: {
-    services?: Array<{
-      id?: number;
-      name?: string;
-      slug?: string;
-      status?: string;
-    }>;
-  } | null;
-  mentee?: {
-    first_name?: string;
-    last_name?: string;
-  } | null;
-  [key: string]: any; // Permitir campos adicionales
+    id: number;
+    status: string;
+    summary?: string | null;
+    started_at?: string | null;
+    mentor_joined_at?: string | null;
+    ended_at?: string | null;
+    mentee_left_at?: string | null;
+    service?: {
+        name?: string;
+        slug?: string;
+    } | null;
+    service_name?: string; // Campo alternativo que puede venir directamente
+    service_slug?: string; // Campo alternativo
+    mentor?: {
+        services?: Array<{
+            id?: number;
+            name?: string;
+            slug?: string;
+            status?: string;
+        }>;
+    } | null;
+    mentee?: {
+        first_name?: string;
+        last_name?: string;
+    } | null;
+    [key: string]: any; // Permitir campos adicionales
 }
 
 /**
  * Obtiene el nombre del servicio de una sesión, buscando en diferentes campos posibles
  */
 export function getServiceName(session: MentorshipSession): string | undefined {
-  // Intentar diferentes campos posibles en orden de prioridad
-  
-  // 1. Campo directo service.name (estructura antigua)
-  if (session.service?.name) return session.service.name;
-  
-  // 2. Campo directo service_name
-  if (session.service_name) return session.service_name;
-  
-  // 3. Buscar en mentor.services[] (estructura nueva del API)
-  if (session.mentor?.services && Array.isArray(session.mentor.services) && session.mentor.services.length > 0) {
-    // Tomar el primer servicio activo, o el primero si no hay activos
-    const activeService = session.mentor.services.find(s => s.status === 'ACTIVE') || session.mentor.services[0];
-    if (activeService?.name) return activeService.name;
-    if (activeService?.slug) return activeService.slug;
-  }
-  
-  // 4. Campos alternativos
-  if (session.service?.slug) return session.service.slug;
-  if (session.service_slug) return session.service_slug;
-  
-  return undefined;
+    // Intentar diferentes campos posibles en orden de prioridad
+
+    // 1. Campo directo service.name (estructura antigua)
+    if (session.service?.name) return session.service.name;
+
+    // 2. Campo directo service_name
+    if (session.service_name) return session.service_name;
+
+    // 3. Buscar en mentor.services[] (estructura nueva del API)
+    if (session.mentor?.services && Array.isArray(session.mentor.services) && session.mentor.services.length > 0) {
+        // Tomar el primer servicio activo, o el primero si no hay activos
+        const activeService = session.mentor.services.find(s => s.status === 'ACTIVE') || session.mentor.services[0];
+        if (activeService?.name) return activeService.name;
+        if (activeService?.slug) return activeService.slug;
+    }
+
+    // 4. Campos alternativos
+    if (session.service?.slug) return session.service.slug;
+    if (session.service_slug) return session.service_slug;
+
+    return undefined;
 }
 
 /**
@@ -80,172 +80,172 @@ export function getServiceName(session: MentorshipSession): string | undefined {
  * También intenta usar otros campos de fecha si los principales no están disponibles
  */
 export function getMentorshipStartTime(session: MentorshipSession): Date | null {
-  // Campos principales
-  const dates = [session.started_at, session.mentor_joined_at]
-    .map((d) => (d ? new Date(d) : null))
-    .filter((d): d is Date => d !== null && !isNaN(d.getTime()));
-  
-  // Si no hay fechas principales, intentar otros campos posibles
-  if (dates.length === 0) {
-    // Buscar cualquier campo que contenga "start" o "begin"
-    const alternativeFields = Object.keys(session).filter(key => 
-      key.toLowerCase().includes('start') || 
-      key.toLowerCase().includes('begin') ||
-      key.toLowerCase().includes('created')
-    );
-    
-    for (const field of alternativeFields) {
-      const value = (session as any)[field];
-      if (value) {
-        const date = new Date(value);
-        if (!isNaN(date.getTime())) {
-          dates.push(date);
+    // Campos principales
+    const dates = [session.started_at, session.mentor_joined_at]
+        .map((d) => (d ? new Date(d) : null))
+        .filter((d): d is Date => d !== null && !isNaN(d.getTime()));
+
+    // Si no hay fechas principales, intentar otros campos posibles
+    if (dates.length === 0) {
+        // Buscar cualquier campo que contenga "start" o "begin"
+        const alternativeFields = Object.keys(session).filter(key =>
+            key.toLowerCase().includes('start') ||
+            key.toLowerCase().includes('begin') ||
+            key.toLowerCase().includes('created')
+        );
+
+        for (const field of alternativeFields) {
+            const value = (session as any)[field];
+            if (value) {
+                const date = new Date(value);
+                if (!isNaN(date.getTime())) {
+                    dates.push(date);
+                }
+            }
         }
-      }
     }
-  }
-  
-  if (dates.length === 0) return null;
-  
-  // Retornar la más tardía
-  return dates.sort((a, b) => b.getTime() - a.getTime())[0];
+
+    if (dates.length === 0) return null;
+
+    // Retornar la más tardía
+    return dates.sort((a, b) => b.getTime() - a.getTime())[0];
 }
 
 /**
  * Obtiene la hora de fin de la mentoría (la más temprana entre ended_at y mentee_left_at)
  */
 export function getMentorshipEndTime(session: MentorshipSession): Date | null {
-  const dates = [session.ended_at, session.mentee_left_at]
-    .map((d) => (d ? new Date(d) : null))
-    .filter((d): d is Date => d !== null && !isNaN(d.getTime()));
-  
-  if (dates.length === 0) return null;
-  
-  // Retornar la más temprana
-  return dates.sort((a, b) => a.getTime() - b.getTime())[0];
+    const dates = [session.ended_at, session.mentee_left_at]
+        .map((d) => (d ? new Date(d) : null))
+        .filter((d): d is Date => d !== null && !isNaN(d.getTime()));
+
+    if (dates.length === 0) return null;
+
+    // Retornar la más temprana
+    return dates.sort((a, b) => a.getTime() - b.getTime())[0];
 }
 
 /**
  * Calcula la duración en minutos entre dos fechas
  */
 export function calculateDuration(startTime: Date, endTime: Date): number {
-  if (isNaN(startTime.getTime()) || isNaN(endTime.getTime())) return 0;
-  return Math.round((endTime.getTime() - startTime.getTime()) / 60000);
+    if (isNaN(startTime.getTime()) || isNaN(endTime.getTime())) return 0;
+    return Math.round((endTime.getTime() - startTime.getTime()) / 60000);
 }
 
 /**
  * Determina el tipo de servicio
  */
 export function determineServiceType(serviceName?: string): ServiceType {
-  if (!serviceName) return 'Mentoría';
-  if (serviceName === MOCK_SERVICE || serviceName.toLowerCase().includes('mock')) {
-    return 'Mock interview';
-  }
-  return 'Mentoría';
+    if (!serviceName) return 'Mentoría';
+    if (serviceName === MOCK_SERVICE || serviceName.toLowerCase().includes('mock')) {
+        return 'Mock interview';
+    }
+    return 'Mentoría';
 }
 
 /**
  * Determina si una mentoría se debe pagar
  */
 export function shouldPayMentorship(minutos: number, serviceName?: string): boolean {
-  return calcularHorasPagas(minutos, serviceName) > 0;
+    return calcularHorasPagas(minutos, serviceName) > 0;
 }
 
 /**
  * Verifica si es un servicio pagado
  */
 function isPaidService(serviceName?: string): boolean {
-  if (!serviceName) return false;
-  return PAID_SERVICES.includes(serviceName) || serviceName === MOCK_SERVICE;
+    if (!serviceName) return false;
+    return PAID_SERVICES.includes(serviceName) || serviceName === MOCK_SERVICE;
 }
 
 /**
  * Calcula el status de una mentoría
  */
 export function calculateMentorshipStatus(session: MentorshipSession): MentorshipStatus {
-  const startTime = getMentorshipStartTime(session);
-  const endTime = getMentorshipEndTime(session);
-  
-  // Si no hay fecha de inicio, no se puede procesar
-  if (!startTime) {
-    return 'No realizada';
-  }
-  
-  // Caso especial: mentoría FAILED pero realizada (error de plataforma)
-  // Estas se marcan como "A pagar" si cumplen los criterios porque sí se realizaron
-  const esFailedPeroRealizada =
-    session.status === 'FAILED' &&
-    session.summary === 'Automatically closed because its ends was two hours ago or more' &&
-    session.started_at &&
-    session.mentee_left_at;
-  
-  // Si no hay fecha de fin, es una mentoría no realizada
-  if (!endTime) {
-    if (session.status === 'FAILED') {
-      return 'No realizada';
+    const startTime = getMentorshipStartTime(session);
+    const endTime = getMentorshipEndTime(session);
+
+    // Si no hay fecha de inicio, no se puede procesar
+    if (!startTime) {
+        return 'No realizada';
     }
-    // Si está COMPLETED pero no tiene endTime, podría ser un error
-    return 'No realizada';
-  }
-  
-  // Calcular duración
-  const minutos = calculateDuration(startTime, endTime);
-  
-  // Obtener nombre del servicio usando la función helper
-  const serviceName = getServiceName(session);
-  
-  // Si es FAILED pero realizada, verificar criterios de pago
-  // Estas se marcan como "A pagar" si cumplen los criterios (duración > 15 min y servicio pagado)
-  if (esFailedPeroRealizada) {
-    if (minutos > 15 && isPaidService(serviceName)) {
-      return 'A pagar';
+
+    // Caso especial: mentoría FAILED pero realizada (error de plataforma)
+    // Estas se marcan como "A pagar" si cumplen los criterios porque sí se realizaron
+    const esFailedPeroRealizada =
+        session.status === 'FAILED' &&
+        session.summary === 'Automatically closed because its ends was two hours ago or more' &&
+        session.started_at &&
+        session.mentee_left_at;
+
+    // Si no hay fecha de fin, es una mentoría no realizada
+    if (!endTime) {
+        if (session.status === 'FAILED') {
+            return 'No realizada';
+        }
+        // Si está COMPLETED pero no tiene endTime, podría ser un error
+        return 'No realizada';
     }
+
+    // Calcular duración
+    const minutos = calculateDuration(startTime, endTime);
+
+    // Obtener nombre del servicio usando la función helper
+    const serviceName = getServiceName(session);
+
+    // Si es FAILED pero realizada, verificar criterios de pago
+    // Estas se marcan como "A pagar" si cumplen los criterios (duración > 15 min y servicio pagado)
+    if (esFailedPeroRealizada) {
+        if (minutos > 15 && isPaidService(serviceName)) {
+            return 'A pagar';
+        }
+        return 'No corresponde';
+    }
+
+    // Si dura menos de 15 minutos, no corresponde pago
+    if (minutos <= 15) {
+        return 'No corresponde';
+    }
+
+    // Verificar si es un servicio pagado
+    const isPaid = isPaidService(serviceName);
+
+    // Debug: Log para identificar problemas
+    if (!isPaid && serviceName) {
+        console.log(`⚠️ [calculateMentorshipStatus] Servicio no pagado: "${serviceName}" (minutos: ${minutos})`);
+        console.log(`   Servicios pagados disponibles:`, PAID_SERVICES);
+    }
+
+    if (!isPaid) {
+        return 'No corresponde';
+    }
+
+    // Si se debe pagar, retornar "A pagar"
+    const shouldPay = shouldPayMentorship(minutos, serviceName);
+
+    if (!shouldPay) {
+        console.log(`⚠️ [calculateMentorshipStatus] shouldPayMentorship retornó false para: "${serviceName}" (minutos: ${minutos})`);
+    }
+
+    if (shouldPay) {
+        return 'A pagar';
+    }
+
     return 'No corresponde';
-  }
-  
-  // Si dura menos de 15 minutos, no corresponde pago
-  if (minutos <= 15) {
-    return 'No corresponde';
-  }
-  
-  // Verificar si es un servicio pagado
-  const isPaid = isPaidService(serviceName);
-  
-  // Debug: Log para identificar problemas
-  if (!isPaid && serviceName) {
-    console.log(`⚠️ [calculateMentorshipStatus] Servicio no pagado: "${serviceName}" (minutos: ${minutos})`);
-    console.log(`   Servicios pagados disponibles:`, PAID_SERVICES);
-  }
-  
-  if (!isPaid) {
-    return 'No corresponde';
-  }
-  
-  // Si se debe pagar, retornar "A pagar"
-  const shouldPay = shouldPayMentorship(minutos, serviceName);
-  
-  if (!shouldPay) {
-    console.log(`⚠️ [calculateMentorshipStatus] shouldPayMentorship retornó false para: "${serviceName}" (minutos: ${minutos})`);
-  }
-  
-  if (shouldPay) {
-    return 'A pagar';
-  }
-  
-  return 'No corresponde';
 }
 
 /**
  * Obtiene el nombre completo del estudiante
  */
 export function getStudentName(session: MentorshipSession): string {
-  const mentee = session.mentee;
-  if (!mentee) return 'Estudiante desconocido';
-  
-  const firstName = mentee.first_name || '';
-  const lastName = mentee.last_name || '';
-  const fullName = [firstName, lastName].filter(Boolean).join(' ');
-  
-  return fullName || 'Estudiante desconocido';
+    const mentee = session.mentee;
+    if (!mentee) return 'Estudiante desconocido';
+
+    const firstName = mentee.first_name || '';
+    const lastName = mentee.last_name || '';
+    const fullName = [firstName, lastName].filter(Boolean).join(' ');
+
+    return fullName || 'Estudiante desconocido';
 }
 

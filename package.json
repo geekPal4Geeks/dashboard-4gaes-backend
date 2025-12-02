@@ -5,8 +5,10 @@
 	"main": "index.ts",
 	"scripts": {
 		"build": "tsc",
-		"start": "node api/index.js",
-		"dev": "nodemon --watch ./api --ext ts --exec ts-node api/index.ts",
+		"start": "node dist/api/index.js",
+		"dev:compile": "tsc --watch",
+		"dev:run": "nodemon --watch ./dist --ext js --exec node dist/api/index.js",
+		"dev": "nodemon --watch ./api --ext ts --exec \"tsc && node dist/api/index.js\"",
 		"lint": "eslint ."
 	},
 	"keywords": [],
