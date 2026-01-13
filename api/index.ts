@@ -4172,8 +4172,20 @@ app.get('/api/mentor/cancelled-mentorships', authMiddleware, async (req, res) =>
         // Procesar cancelaciones
         const processedCancellations: any[] = [];
 
+        // Preparar nombres para validación (nombre completo y apellido)
+        const nameParts = mentorName.trim().split(/\s+/);
+        const lastName = nameParts.length > 1 ? nameParts[nameParts.length - 1] : mentorName;
+        const mentorNamesForValidation = [mentorName, lastName];
+
         cancellations.forEach((cancellation: any) => {
             const properties = cancellation.properties || {};
+
+            // Validar que la cancelación pertenezca al mentor (validación adicional de seguridad)
+            const cancellationMentor = properties['Mentor/a']?.select?.name;
+            if (!cancellationMentor || !mentorNamesForValidation.includes(cancellationMentor)) {
+                console.log(`⚠️ [cancelled-mentorships] Cancelación ${cancellation.id} excluida: no pertenece al mentor ${mentorName} (mentor en cancelación: ${cancellationMentor || 'sin mentor'})`);
+                return;
+            }
 
             // Extraer fecha de mentoría
             const mentorshipDateProp = properties['Fecha y hora de mentoría']?.date;
