@@ -1023,64 +1023,82 @@ app.post('/api/create-student-comment', authorizeRoles(), async (req, res) => {
             return res.status(404).json({ error: 'No se pudo crear el comentario' });
         }
 
+        // Obtener datos del estudiante para notificaciones
+        let slackId: string | undefined;
+        let geekforceCoach = '';
+        let studentName = '';
+        let studentEmail = '';
+        let academy = '';
+
+        try {
+            const studentPage = await notion.pages.retrieve({ page_id: studentId }) as any;
+            slackId = studentPage?.properties?.['Slack ID']?.rich_text?.[0]?.text?.content;
+            geekforceCoach = studentPage?.properties?.['GeekFORCE Coach']?.select?.name || '';
+            studentName = studentPage?.properties?.Student?.title?.[0]?.plain_text
+                || studentPage?.properties?.Name?.title?.[0]?.plain_text
+                || 'Estudiante desconocido';
+            studentEmail = studentPage?.properties?.Email?.email || '';
+            academy = studentPage?.properties?.Academy?.select?.name || '';
+        } catch (studentPageError) {
+            console.error('Error obteniendo datos del estudiante:', studentPageError);
+        }
+
         // Verificar si es una Mock Interview (realizada o cancelada)
         const isMockInterview = comment.includes('Mock Interview') || comment.includes('Mock interview');
 
-        if (isMockInterview) {
+        if (isMockInterview && slackId) {
             try {
-                // Obtener el slack_id del estudiante
-                const studentPage = await notion.pages.retrieve({
-                    page_id: studentId
-                }) as any;
+                const message = `<@${slackId}> ${comment}`;
 
-                // Acceder al slack_id y al GeekFORCE Coach de manera segura
-                const slackId = studentPage?.properties?.['Slack ID']?.rich_text?.[0]?.text?.content;
-                const geekforceCoach = studentPage?.properties?.['GeekFORCE Coach']?.select?.name || '';
-
-                if (slackId) {
-                    const message = `<@${slackId}> ${comment}`;
-
-                    // Enviar notificación a Zapier
-                    await fetch(process.env.ZAPIER_MOCK_INTERVIEW_WEBHOOK_URL || '', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({
-                            message,
-                            slack_id: slackId,
-                            coach_name: geekforceCoach,
-                            channel_id: 'C07KVERC474'
-                        })
-                    });
+                // Determinar canal de Slack según Academy
+                // Por defecto (vacío) se asume 6-Spain
+                let slackChannel = 'C07KVERC474'; // Spain / Europe
+                if (academy === '7-Latam') {
+                    slackChannel = 'C07KVERC474'; // TODO: reemplazar con canal correcto de Latam
                 }
-            } catch (zapierError) {
+
+                // Enviar mensaje directamente a Slack via API
+                await fetch('https://slack.com/api/chat.postMessage', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}`
+                    },
+                    body: JSON.stringify({
+                        channel: slackChannel,
+                        text: message
+                    })
+                });
+            } catch (slackError) {
                 // Solo logueamos el error pero no fallamos la operación principal
-                console.error('Error enviando notificación a Zapier:', zapierError);
+                console.error('Error enviando mensaje a Slack:', slackError);
             }
         }
 
-        // Procesar la notificación original si existe
-        if (notificationData && notificationData.type === 'mock_interview_cancellation' && notificationData.slackId) {
+        // Procesar la notificación de cancelación si existe
+        if (notificationData && notificationData.type === 'mock_interview_cancellation' && slackId) {
             try {
-                const message = `Hola! <@${notificationData.slackId}> Nos han informado que has cancelado tu sesión de Mock interview, recuerda que debes reprogramarla para continuar con tu proceso de carreras! Un saludo.`;
+                const message = `Hola! <@${slackId}> Nos han informado que has cancelado tu sesión de Mock interview, recuerda que debes reprogramarla para continuar con tu proceso de carreras! Un saludo.`;
 
-                // Enviar notificación a Zapier
-                await fetch(process.env.ZAPIER_CANCELLATION_WEBHOOK_URL || '', {
+                // Enviar notificación a N8N
+                await fetch(process.env.N8N_GF_WEBHOOK_URL || '', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({
-                        message,
-                        slack_id: notificationData.slackId,
-                        coach_name: notificationData.coachName,
-
-                    })
+                    body: JSON.stringify([{
+                        coachIdentifier: geekforceCoach,
+                        studentName: studentName,
+                        studentSlackID: slackId,
+                        messageContent: message,
+                        messageType: 'Direct Message',
+                        studentEmail: studentEmail,
+                        emailSubject: null
+                    }])
                 });
-            } catch (zapierError) {
+            } catch (webhookError) {
                 // Solo logueamos el error pero no fallamos la operación principal
-                console.error('Error enviando notificación a Zapier:', zapierError);
+                console.error('Error enviando notificación a N8N:', webhookError);
             }
         }
 
