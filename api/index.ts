@@ -34,6 +34,8 @@ import {
 
 dotenv.config();
 
+const ALLOWED_ACADEMY_IDS = [6, 7];
+
 const app = express();
 const urlencodedParser = bodyParser.urlencoded({ extended: false });
 app.use(express.json());
@@ -82,14 +84,14 @@ function authorizeRoles(notAllowedRoles: string[] = []) {
         const userRoles = (req as any).user4GeeksData.roles || [];
         // Si el usuario tiene algún rol explícitamente no permitido, negar acceso
         const hasNotAllowedRole = userRoles.some(roleObj =>
-            notAllowedRoles.includes(roleObj.role) && roleObj.academy && roleObj.academy.id === 6
+            notAllowedRoles.includes(roleObj.role) && roleObj.academy && ALLOWED_ACADEMY_IDS.includes(roleObj.academy.id)
         );
         if (hasNotAllowedRole) {
             return res.status(403).json({ message: 'No tienes permisos' });
         }
         // Si el usuario NO tiene al menos uno de los roles permitidos, negar acceso
         const hasAllowedRole = userRoles.some(roleObj =>
-            allowedRoles.includes(roleObj.role) && roleObj.academy && roleObj.academy.id === 6
+            allowedRoles.includes(roleObj.role) && roleObj.academy && ALLOWED_ACADEMY_IDS.includes(roleObj.academy.id)
         );
         if (!hasAllowedRole) {
             return res.status(403).json({ message: 'No tienes permisos (rol no permitido)' });
@@ -105,7 +107,7 @@ function authorizeRoles(notAllowedRoles: string[] = []) {
 //         const userRoles = (req as any).user4GeeksData.roles || [];
 //         // Si el usuario tiene al menos uno de los roles de mentor, permitir acceso
 //         const hasMentorRole = userRoles.some(roleObj =>
-//             mentorRoles.includes(roleObj.role) && roleObj.academy && roleObj.academy.id === 6
+//             mentorRoles.includes(roleObj.role) && roleObj.academy && ALLOWED_ACADEMY_IDS.includes(roleObj.academy.id)
 //         );
 //         if (!hasMentorRole) {
 //             return res.status(403).json({ message: 'Solo los mentores pueden acceder a esta información' });
@@ -1042,10 +1044,10 @@ app.post('/api/create-student-comment', authorizeRoles(), async (req, res) => {
         } catch (studentPageError) {
             console.error('Error obteniendo datos del estudiante:', studentPageError);
         }
-
+        
         // Verificar si es una Mock Interview (realizada o cancelada)
         const isMockInterview = comment.includes('Mock Interview') || comment.includes('Mock interview');
-
+        console.log("=========Es mockInterview", isMockInterview, "  Slack  ", slackId)
         if (isMockInterview && slackId) {
             try {
                 const message = `<@${slackId}> ${comment}`;
@@ -1058,7 +1060,7 @@ app.post('/api/create-student-comment', authorizeRoles(), async (req, res) => {
                 }
 
                 // Enviar mensaje directamente a Slack via API
-                await fetch('https://slack.com/api/chat.postMessage', {
+                const slackResponse = await fetch('https://slack.com/api/chat.postMessage', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -1069,6 +1071,12 @@ app.post('/api/create-student-comment', authorizeRoles(), async (req, res) => {
                         text: message
                     })
                 });
+                const slackResult = await slackResponse.json() as { ok: boolean; error?: string };
+                if (!slackResult.ok) {
+                    console.error('Slack API error (mock interview):', slackResult.error, slackResult);
+                } else {
+                    console.log('Slack message sent successfully to channel:', slackChannel);
+                }
             } catch (slackError) {
                 // Solo logueamos el error pero no fallamos la operación principal
                 console.error('Error enviando mensaje a Slack:', slackError);
@@ -1737,10 +1745,10 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         // Determinar el rol del usuario autenticado
         const userRoles = (req as any).user4GeeksData?.roles || [];
         const isAssistant = userRoles.some((roleObj: any) =>
-            roleObj.role === 'assistant' && roleObj.academy && roleObj.academy.id === 6
+            roleObj.role === 'assistant' && roleObj.academy && ALLOWED_ACADEMY_IDS.includes(roleObj.academy.id)
         );
         const isTeacher = userRoles.some((roleObj: any) =>
-            roleObj.role === 'teacher' && roleObj.academy && roleObj.academy.id === 6
+            roleObj.role === 'teacher' && roleObj.academy && ALLOWED_ACADEMY_IDS.includes(roleObj.academy.id)
         );
 
         const COHORTS_DB_FOR_EVALS_SEARCH = process.env.NOTION_COHORTS_DATABASE_ID || process.env.NOTION_DATABASE_ID || '';
@@ -3038,7 +3046,7 @@ app.post('/api/mentors/assistant-debug', authorizeTeachersOrAssistants(), async 
         }
 
         const isAssistant = userRoles.some((roleObj: any) =>
-            roleObj.role === 'assistant' && roleObj.academy && roleObj.academy.id === 6
+            roleObj.role === 'assistant' && roleObj.academy && ALLOWED_ACADEMY_IDS.includes(roleObj.academy.id)
         );
 
         if (!isAssistant) {
@@ -4031,17 +4039,14 @@ app.get('/api/mentor/my-mentorships', authMiddleware, async (req, res) => {
         const authHeader = req.headers['authorization'] as string;
         const token = authHeader.split(' ')[1];
 
-        // Obtener Academy ID (por defecto 6, según el plan)
-        const academyId = process.env.API_ACADEMY || '6';
-
         // Obtener nombre del mentor
         const userData = (req as any).user4GeeksData;
         const mentorName = userData?.first_name && userData?.last_name
             ? `${userData.first_name} ${userData.last_name}`
             : userData?.username || 'Mentor';
 
-        // Obtener mentorías del API
-        const sessions = await fetchMentorSessions(token, academyId);
+        // Obtener mentorías del API (consulta todas las academias en paralelo)
+        const sessions = await fetchMentorSessions(token, ALLOWED_ACADEMY_IDS.map(String));
 
         // Calcular fechas de periodos según el tipo seleccionado
         const currentPeriod = periodType === 'monthly'
