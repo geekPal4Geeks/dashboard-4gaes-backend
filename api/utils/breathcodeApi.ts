@@ -4,48 +4,60 @@
 
 import fetch from 'node-fetch';
 
+async function fetchSessionsForAcademy(
+  token: string,
+  academyId: string,
+  apiUrl: string
+): Promise<any[]> {
+  const url = `${apiUrl}/mentorship/user/me/session`;
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Token ${token}`,
+      'Academy': academyId,
+    },
+  });
+
+  if (!response.ok) {
+    console.error(`Error al obtener mentorías para academy ${academyId}: ${response.status} ${response.statusText}`);
+    return [];
+  }
+
+  const data: any = await response.json();
+
+  if (Array.isArray(data)) {
+    return data;
+  }
+
+  if (data && typeof data === 'object' && 'results' in data && Array.isArray(data.results)) {
+    return data.results;
+  }
+
+  return [];
+}
+
 /**
- * Obtiene las sesiones de mentoría del mentor autenticado
+ * Obtiene las sesiones de mentoría del mentor autenticado desde una o más academias.
+ * Realiza peticiones en paralelo y combina los resultados.
  * @param token Token de autenticación
- * @param academyId ID de la academia (default: 6)
- * @returns Array de sesiones de mentoría
+ * @param academyIds IDs de las academias (default: ['6', '7'])
+ * @returns Array combinado de sesiones de mentoría
  */
 export async function fetchMentorSessions(
   token: string,
-  academyId: string = '6'
+  academyIds: string[] = ['6', '7']
 ): Promise<any[]> {
   const apiUrl = process.env.BREATHCODE_API_URL;
   if (!apiUrl) {
     throw new Error('BREATHCODE_API_URL no está configurado en las variables de entorno');
   }
 
-  const url = `${apiUrl}/mentorship/user/me/session`;
-  
   try {
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Token ${token}`,
-        'Academy': academyId,
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`Error al obtener mentorías: ${response.status} ${response.statusText}`);
-    }
-
-    const data: any = await response.json();
-    
-    // La API puede retornar un array directamente o un objeto con results
-    if (Array.isArray(data)) {
-      return data;
-    }
-    
-    if (data && typeof data === 'object' && 'results' in data && Array.isArray(data.results)) {
-      return data.results;
-    }
-    
-    return [];
+    const results = await Promise.all(
+      academyIds.map(id => fetchSessionsForAcademy(token, id, apiUrl))
+    );
+    return results.flat();
   } catch (error: any) {
     console.error('Error al obtener mentorías del API:', error.message);
     throw error;
