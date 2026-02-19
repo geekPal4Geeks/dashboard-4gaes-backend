@@ -36,6 +36,12 @@ dotenv.config();
 
 const ALLOWED_ACADEMY_IDS = [6, 7];
 
+const COACH_SLACK_IDS: Record<string, string> = {
+    'Daniela Maestre': 'U08BCQN1EES',
+    'Andrea Velazco': 'U09MGS6A37B',
+    'Melissa Zwanck': 'U06CE41PNMS',
+};
+
 const app = express();
 const urlencodedParser = bodyParser.urlencoded({ extended: false });
 app.use(express.json());
@@ -1044,13 +1050,15 @@ app.post('/api/create-student-comment', authorizeRoles(), async (req, res) => {
         } catch (studentPageError) {
             console.error('Error obteniendo datos del estudiante:', studentPageError);
         }
-        
+
         // Verificar si es una Mock Interview (realizada o cancelada)
         const isMockInterview = comment.includes('Mock Interview') || comment.includes('Mock interview');
-        console.log("=========Es mockInterview", isMockInterview, "  Slack  ", slackId)
+
         if (isMockInterview && slackId) {
             try {
-                const message = `<@${slackId}> ${comment}`;
+                const coachSlackId = COACH_SLACK_IDS[geekforceCoach];
+                const coachMention = coachSlackId ? ` cc <@${coachSlackId}>` : '';
+                const message = `<@${slackId}> ${comment}${coachMention}`;
 
                 // Determinar canal de Slack según Academy
                 // Por defecto (vacío) se asume 6-Spain
@@ -1060,7 +1068,7 @@ app.post('/api/create-student-comment', authorizeRoles(), async (req, res) => {
                 }
 
                 // Enviar mensaje directamente a Slack via API
-                const slackResponse = await fetch('https://slack.com/api/chat.postMessage', {
+                await fetch('https://slack.com/api/chat.postMessage', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -1071,12 +1079,6 @@ app.post('/api/create-student-comment', authorizeRoles(), async (req, res) => {
                         text: message
                     })
                 });
-                const slackResult = await slackResponse.json() as { ok: boolean; error?: string };
-                if (!slackResult.ok) {
-                    console.error('Slack API error (mock interview):', slackResult.error, slackResult);
-                } else {
-                    console.log('Slack message sent successfully to channel:', slackChannel);
-                }
             } catch (slackError) {
                 // Solo logueamos el error pero no fallamos la operación principal
                 console.error('Error enviando mensaje a Slack:', slackError);
