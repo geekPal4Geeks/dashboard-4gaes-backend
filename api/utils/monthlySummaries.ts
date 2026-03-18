@@ -15,6 +15,10 @@ export interface ProcessedMentorship {
   status: MentorshipStatus;
   canRequestReview: boolean;
   period: 'current' | 'previous';
+  isCancelled?: boolean;
+  cancellationDate?: string;
+  cancellationReason?: string;
+  notes?: string;
 }
 
 export interface MonthlySummary {
