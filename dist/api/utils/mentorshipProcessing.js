@@ -20,16 +20,7 @@ export function getServiceName(session) {
     // 2. Campo directo service_name
     if (session.service_name)
         return session.service_name;
-    // 3. Buscar en mentor.services[] (estructura nueva del API)
-    if (session.mentor?.services && Array.isArray(session.mentor.services) && session.mentor.services.length > 0) {
-        // Tomar el primer servicio activo, o el primero si no hay activos
-        const activeService = session.mentor.services.find(s => s.status === 'ACTIVE') || session.mentor.services[0];
-        if (activeService?.name)
-            return activeService.name;
-        if (activeService?.slug)
-            return activeService.slug;
-    }
-    // 4. Campos alternativos
+    // 3. Campos alternativos ligados a la sesión
     if (session.service?.slug)
         return session.service.slug;
     if (session.service_slug)
@@ -108,7 +99,7 @@ export function shouldPayMentorship(minutos, serviceName) {
  */
 function isPaidService(serviceName) {
     if (!serviceName)
-        return false;
+        return true;
     return PAID_SERVICES.includes(serviceName) || serviceName === MOCK_SERVICE;
 }
 /**

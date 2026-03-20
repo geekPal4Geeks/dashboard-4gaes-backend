@@ -20,7 +20,11 @@ async function fetchSessionsForAcademy(
   });
 
   if (!response.ok) {
-    console.error(`Error al obtener mentorías para academy ${academyId}: ${response.status} ${response.statusText}`);
+    if (response.status === 401 || response.status === 403) {
+      throw new Error(`BREATHCODE_AUTH_${response.status}`);
+    }
+
+    console.error(`Error al obtener mentorias para academy ${academyId}: ${response.status} ${response.statusText}`);
     return [];
   }
 
@@ -38,11 +42,11 @@ async function fetchSessionsForAcademy(
 }
 
 /**
- * Obtiene las sesiones de mentoría del mentor autenticado desde una o más academias.
+ * Obtiene las sesiones de mentoria del mentor autenticado desde una o mas academias.
  * Realiza peticiones en paralelo y combina los resultados.
- * @param token Token de autenticación
+ * @param token Token de autenticacion
  * @param academyIds IDs de las academias (default: ['6', '7'])
- * @returns Array combinado de sesiones de mentoría
+ * @returns Array combinado de sesiones de mentoria
  */
 export async function fetchMentorSessions(
   token: string,
@@ -50,7 +54,7 @@ export async function fetchMentorSessions(
 ): Promise<any[]> {
   const apiUrl = process.env.BREATHCODE_API_URL;
   if (!apiUrl) {
-    throw new Error('BREATHCODE_API_URL no está configurado en las variables de entorno');
+    throw new Error('BREATHCODE_API_URL no esta configurado en las variables de entorno');
   }
 
   try {
@@ -59,8 +63,7 @@ export async function fetchMentorSessions(
     );
     return results.flat();
   } catch (error: any) {
-    console.error('Error al obtener mentorías del API:', error.message);
+    console.error('Error al obtener mentorias del API:', error.message);
     throw error;
   }
 }
-

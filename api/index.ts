@@ -5,6 +5,7 @@ import { Client, LogLevel } from '@notionhq/client';
 import { NotionAPI } from 'notion-client';
 import cors from 'cors';
 import bodyParser from 'body-parser';
+import multer from 'multer';
 import path from 'path';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
@@ -41,6 +42,14 @@ const COACH_SLACK_IDS: Record<string, string> = {
     'Andrea Velazco': 'U09MGS6A37B',
     'Melissa Zwanck': 'U06CE41PNMS',
 };
+const NOTION_API_VERSION = '2026-03-11';
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+        files: 3,
+        fileSize: 20 * 1024 * 1024,
+    },
+});
 
 const app = express();
 const urlencodedParser = bodyParser.urlencoded({ extended: false });
@@ -106,6 +115,14 @@ function authorizeRoles(notAllowedRoles: string[] = []) {
     };
 }
 
+function hasAllowedAcademyRole(roles: any[], allowed: string[]) {
+    return roles.some((roleObj: any) =>
+        allowed.includes(roleObj.role) &&
+        roleObj.academy &&
+        ALLOWED_ACADEMY_IDS.includes(roleObj.academy.id)
+    );
+}
+
 // Middleware específico para mentores (solo teachers y coordinadores)
 // function authorizeMentors() {
 //     const mentorRoles = ['teacher', 'academy_coordinator', 'country_manager'];
@@ -126,9 +143,43 @@ function authorizeTeachersOrAssistants() {
     const allowed = ['teacher', 'assistant'];
     return (req: Request, res: Response, next: NextFunction) => {
         const roles = (req as any).user4GeeksData?.roles || [];
-        const hasAllowed = roles.some((r: any) => allowed.includes(r.role));
+        const hasAllowed = hasAllowedAcademyRole(roles, allowed);
         if (!hasAllowed) return res.status(403).json({ message: 'Requiere rol teacher o assistant' });
         next();
+    };
+}
+
+function authorizeCoordinatorOrAdmin() {
+    const allowed = ['academy_coordinator', 'admin'];
+    return (req: Request, res: Response, next: NextFunction) => {
+        const roles = (req as any).user4GeeksData?.roles || [];
+        if (!hasAllowedAcademyRole(roles, allowed)) {
+            return res.status(403).json({ message: 'Requiere rol academy_coordinator o admin' });
+        }
+        next();
+    };
+}
+
+function authorizeMentorDataAccess() {
+    return (req: Request, res: Response, next: NextFunction) => {
+        const roles = (req as any).user4GeeksData?.roles || [];
+        const requestedEmail = typeof req.body?.email === 'string'
+            ? req.body.email.trim().toLowerCase()
+            : typeof req.query?.email === 'string'
+                ? req.query.email.trim().toLowerCase()
+                : '';
+
+        if (hasAllowedAcademyRole(roles, ['teacher', 'assistant'])) {
+            return next();
+        }
+
+        if (requestedEmail && hasAllowedAcademyRole(roles, ['academy_coordinator', 'admin'])) {
+            return next();
+        }
+
+        return res.status(403).json({
+            message: 'Requiere rol teacher/assistant o academy_coordinator/admin con email objetivo'
+        });
     };
 }
 
@@ -141,6 +192,69 @@ const notion = new Client({
 
 // Configuración del NotionAPI de react-notion-x
 const notionX = new NotionAPI();
+
+async function notionApiFetch<T = any>(url: string, init: any): Promise<T> {
+    const response = await fetch(url, {
+        ...init,
+        headers: {
+            Authorization: `Bearer ${process.env.NOTION_TOKEN}`,
+            'Notion-Version': NOTION_API_VERSION,
+            ...(init?.headers || {}),
+        },
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Notion API ${response.status}: ${errorText}`);
+    }
+
+    return response.json() as Promise<T>;
+}
+
+async function uploadCommentAttachments(files: Express.Multer.File[] = []) {
+    const attachments: Array<{ file_upload_id: string; type: 'file_upload'; }> = [];
+
+    for (const file of files.slice(0, 3)) {
+        const fileUpload = await notionApiFetch<any>('https://api.notion.com/v1/file_uploads', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                mode: 'single_part',
+                filename: file.originalname,
+                content_type: file.mimetype || 'application/octet-stream',
+            }),
+        });
+
+        const formData = new FormData();
+        const blob = new Blob([file.buffer], {
+            type: file.mimetype || 'application/octet-stream',
+        });
+        formData.append('file', blob, file.originalname);
+
+        const uploadResponse = await fetch(fileUpload.upload_url, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${process.env.NOTION_TOKEN}`,
+                'Notion-Version': NOTION_API_VERSION,
+            },
+            body: formData as any,
+        });
+
+        if (!uploadResponse.ok) {
+            const errorText = await uploadResponse.text();
+            throw new Error(`Error enviando archivo a Notion: ${errorText}`);
+        }
+
+        attachments.push({
+            file_upload_id: fileUpload.id,
+            type: 'file_upload',
+        });
+    }
+
+    return attachments;
+}
 
 app.use(express.static('public'));
 
@@ -1003,33 +1117,49 @@ app.put('/api/update-student-property', authorizeRoles(), async (req, res) => {
 });
 
 // Endpoint para crear un comentario en la ficha de un estudiante
-app.post('/api/create-student-comment', authorizeRoles(), async (req, res) => {
+app.post('/api/create-student-comment', authorizeRoles(), upload.array('attachments', 3), async (req, res) => {
     try {
-        const { studentId, comment, notificationData } = req.body;
+        const studentId = typeof req.body?.studentId === 'string' ? req.body.studentId.trim() : '';
+        const comment = typeof req.body?.comment === 'string' ? req.body.comment.trim() : '';
+        const notificationData = typeof req.body?.notificationData === 'string'
+            ? JSON.parse(req.body.notificationData)
+            : req.body?.notificationData || null;
+        const attachmentFiles = (req.files as Express.Multer.File[]) || [];
 
-        if (!studentId || !comment) {
+        if (!studentId || (!comment && attachmentFiles.length === 0)) {
             return res.status(400).json({
-                error: 'Se requieren studentId y comment'
+                error: 'Se requiere studentId y al menos comentario o adjunto'
             });
         }
 
+        const attachments = await uploadCommentAttachments(attachmentFiles);
+
         // Crear el comentario en Notion
-        const response = await notion.comments.create({
-            parent: {
-                page_id: studentId
+        const response = await notionApiFetch<any>('https://api.notion.com/v1/comments', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
             },
-            rich_text: [
-                {
-                    text: {
-                        content: comment
+            body: JSON.stringify({
+                parent: {
+                    block_id: studentId
+                },
+                rich_text: [
+                    {
+                        text: {
+                            content: comment || 'Imagen adjunta'
+                        }
                     }
-                }
-            ]
+                ],
+                ...(attachments.length > 0 ? { attachments } : {}),
+            }),
         });
 
         if (!response) {
             return res.status(404).json({ error: 'No se pudo crear el comentario' });
         }
+
+        studentCommentsCache.delete(studentId);
 
         // Obtener datos del estudiante para notificaciones
         let slackId: string | undefined;
@@ -1112,10 +1242,16 @@ app.post('/api/create-student-comment', authorizeRoles(), async (req, res) => {
             }
         }
 
-        res.status(200).json(response);
-    } catch (error) {
+        res.status(200).json({
+            ...response,
+            attachmentCount: attachments.length,
+        });
+    } catch (error: any) {
         console.error('Error creando comentario:', error);
-        res.status(500).json({ error: 'Error al crear el comentario' });
+        res.status(500).json({
+            error: 'Error al crear el comentario',
+            details: error.message,
+        });
     }
 });
 
@@ -1314,15 +1450,19 @@ app.post('/api/student-comments', authorizeRoles(), async (req, res) => {
             return res.status(400).json({ error: 'Se requiere el ID del estudiante (block_id)' });
         }
 
+        const cachedComments = getCachedValue(studentCommentsCache, studentId);
+        if (cachedComments) {
+            return res.status(200).json(cachedComments);
+        }
+
         const response = await notion.comments.list({
             block_id: studentId,
         });
 
-        if (!response.results || response.results.length === 0) {
-            return res.status(404).json({ error: 'No se encontraron comentarios para este estudiante' });
-        }
+        const enrichedComments = await enrichCommentsWithAuthors(response.results || []);
+        setCachedValue(studentCommentsCache, studentId, enrichedComments, COMMENTS_CACHE_TTL_MS);
 
-        res.status(200).json(response.results);
+        res.status(200).json(enrichedComments);
     } catch (error) {
         console.error('Error obteniendo comentarios de Notion:', error);
         res.status(500).json({ error: 'Error al obtener los comentarios del estudiante' });
@@ -1330,7 +1470,7 @@ app.post('/api/student-comments', authorizeRoles(), async (req, res) => {
 });
 
 // Endpoint para obtener los comentarios de una evaluación NPS
-app.post('/api/nps-comments', authorizeTeachersOrAssistants(), async (req, res) => {
+app.post('/api/nps-comments', authorizeMentorDataAccess(), async (req, res) => {
     try {
         const { npsId } = req.body;
 
@@ -1347,7 +1487,8 @@ app.post('/api/nps-comments', authorizeTeachersOrAssistants(), async (req, res) 
         // Obtener el mentorId del usuario autenticado
         let mentorId: string;
         try {
-            mentorId = await resolveMentorIdFromReq(req);
+            const requestedMentor = await resolveRequestedMentor(req);
+            mentorId = requestedMentor.id;
         } catch (error: any) {
             return res.status(400).json({ error: error.message });
         }
@@ -1369,6 +1510,10 @@ app.post('/api/nps-comments', authorizeTeachersOrAssistants(), async (req, res) 
 
         const evaluation = evaluationQuery.results[0] as any;
         const notionPageId = evaluation.id;
+        const cachedComments = getCachedValue(npsCommentsCache, notionPageId);
+        if (cachedComments) {
+            return res.status(200).json(cachedComments);
+        }
 
         console.log('🔍 [NPS Comments] Buscando comentarios para:');
         console.log('   - NPS ID:', npsId);
@@ -1385,36 +1530,12 @@ app.post('/api/nps-comments', authorizeTeachersOrAssistants(), async (req, res) 
         }
 
         if (!response.results || response.results.length === 0) {
-            return res.status(200).json({
-                comments: [],
-                message: 'No se encontraron comentarios para esta evaluación NPS'
-            });
+            return res.status(200).json([]);
         }
 
         // Enriquecer comentarios con información del autor
-        const enrichedComments = await Promise.all(
-            response.results.map(async (comment: any) => {
-                try {
-                    const authorId = comment.created_by?.id;
-                    if (authorId) {
-                        const author = await notion.users.retrieve({ user_id: authorId });
-                        return {
-                            ...comment,
-                            author: {
-                                id: author.id,
-                                name: author.name,
-                                avatar_url: author.avatar_url,
-                                type: author.type
-                            }
-                        };
-                    }
-                    return comment;
-                } catch (error) {
-                    console.error('Error obteniendo información del autor:', error);
-                    return comment;
-                }
-            })
-        );
+        const enrichedComments = await enrichCommentsWithAuthors(response.results);
+        setCachedValue(npsCommentsCache, notionPageId, enrichedComments, COMMENTS_CACHE_TTL_MS);
 
         console.log('✅ [NPS Comments] Respuesta final:');
         console.log('   - NPS ID:', npsId);
@@ -1422,12 +1543,7 @@ app.post('/api/nps-comments', authorizeTeachersOrAssistants(), async (req, res) 
         console.log('   - Total comentarios:', enrichedComments.length);
         console.log('   - Comentarios enriquecidos:', JSON.stringify(enrichedComments, null, 2));
 
-        res.status(200).json({
-            comments: enrichedComments,
-            npsId: npsId,
-            notionPageId: notionPageId,
-            totalComments: enrichedComments.length
-        });
+        res.status(200).json(enrichedComments);
 
     } catch (error: any) {
         console.error('Error obteniendo comentarios de NPS:', error);
@@ -1454,9 +1570,7 @@ app.post('/api/notion-user', authorizeRoles(), async (req, res) => {
             return res.status(400).json({ error: 'Se requiere el ID del usuario de Notion' });
         }
 
-        const user = await notion.users.retrieve({
-            user_id: userId,
-        });
+        const user = await getCachedNotionUser(userId);
 
         if (!user) {
             return res.status(404).json({ error: 'Usuario de Notion no encontrado' });
@@ -1479,13 +1593,150 @@ async function notionQueryAll(databaseId: string, filter: any, sorts?: any[]) {
             database_id: databaseId,
             filter,
             sorts,
-            start_cursor: cursor
+            start_cursor: cursor,
+            page_size: 100,
         } as any);
         results.push(...page.results);
         cursor = (page as any).next_cursor || undefined;
     } while (cursor);
 
     return results;
+}
+
+function chunkArray<T>(items: T[], size: number) {
+    const chunks: T[][] = [];
+    for (let index = 0; index < items.length; index += size) {
+        chunks.push(items.slice(index, index + size));
+    }
+    return chunks;
+}
+
+async function mapWithConcurrency<T, R>(
+    items: T[],
+    concurrency: number,
+    mapper: (item: T, index: number) => Promise<R>
+) {
+    const results: R[] = new Array(items.length);
+    let cursor = 0;
+
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+        while (cursor < items.length) {
+            const currentIndex = cursor++;
+            results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+        }
+    });
+
+    await Promise.all(workers);
+    return results;
+}
+
+type CacheEntry<T> = {
+    value: T;
+    expiresAt: number;
+};
+
+const DEFAULT_CACHE_TTL_MS = 5 * 60 * 1000;
+const IMPERSONATION_TOKEN_CACHE_TTL_MS = 30 * 60 * 1000;
+const MENTOR_RESPONSE_CACHE_TTL_MS = 2 * 60 * 1000;
+const COMMENTS_CACHE_TTL_MS = 60 * 1000;
+const NOTION_USER_CACHE_TTL_MS = 30 * 60 * 1000;
+const breathcodeMemberIdCache = new Map<string, CacheEntry<string>>();
+const breathcodeImpersonationTokenCache = new Map<string, CacheEntry<string>>();
+const studentNameCache = new Map<string, CacheEntry<string>>();
+const cancellationMentorOptionsCache = new Map<string, CacheEntry<string[]>>();
+const mentorNpsResponseCache = new Map<string, CacheEntry<any>>();
+const mentorMentorshipsResponseCache = new Map<string, CacheEntry<any>>();
+const studentCommentsCache = new Map<string, CacheEntry<any[]>>();
+const npsCommentsCache = new Map<string, CacheEntry<any[]>>();
+const notionUserCache = new Map<string, CacheEntry<any>>();
+const pendingBreathcodeMemberIdLookups = new Map<string, Promise<string>>();
+const pendingBreathcodeTokenLookups = new Map<string, Promise<string>>();
+const pendingStudentNameLookups = new Map<string, Promise<string>>();
+const pendingNotionUserLookups = new Map<string, Promise<any>>();
+
+function getCachedValue<T>(cache: Map<string, CacheEntry<T>>, key: string): T | null {
+    const entry = cache.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+        cache.delete(key);
+        return null;
+    }
+    return entry.value;
+}
+
+function setCachedValue<T>(
+    cache: Map<string, CacheEntry<T>>,
+    key: string,
+    value: T,
+    ttlMs: number = DEFAULT_CACHE_TTL_MS
+): T {
+    cache.set(key, {
+        value,
+        expiresAt: Date.now() + ttlMs,
+    });
+    return value;
+}
+
+function buildCacheKey(...parts: Array<string | number | boolean | null | undefined>) {
+    return parts.map((part) => String(part ?? '')).join('::');
+}
+
+function clearMentorDataCaches() {
+    mentorNpsResponseCache.clear();
+    mentorMentorshipsResponseCache.clear();
+    npsCommentsCache.clear();
+}
+
+async function getCachedNotionUser(userId: string) {
+    const cachedUser = getCachedValue(notionUserCache, userId);
+    if (cachedUser) {
+        return cachedUser;
+    }
+
+    const pendingLookup = pendingNotionUserLookups.get(userId);
+    if (pendingLookup) {
+        return pendingLookup;
+    }
+
+    const lookupPromise = (async () => {
+        const user = await notion.users.retrieve({ user_id: userId });
+        return setCachedValue(notionUserCache, userId, user, NOTION_USER_CACHE_TTL_MS);
+    })();
+
+    pendingNotionUserLookups.set(userId, lookupPromise);
+
+    try {
+        return await lookupPromise;
+    } finally {
+        pendingNotionUserLookups.delete(userId);
+    }
+}
+
+async function enrichCommentsWithAuthors(comments: any[]) {
+    return Promise.all(
+        (comments || []).map(async (comment: any) => {
+            try {
+                const authorId = comment.created_by?.id;
+                if (!authorId) {
+                    return comment;
+                }
+
+                const author = await getCachedNotionUser(authorId);
+                return {
+                    ...comment,
+                    author: {
+                        id: author.id,
+                        name: author.name,
+                        avatar_url: author.avatar_url,
+                        type: author.type
+                    }
+                };
+            } catch (error) {
+                console.error('Error obteniendo autor de comentario:', error);
+                return comment;
+            }
+        })
+    );
 }
 
 // Helper para calcular métricas NPS
@@ -1648,10 +1899,437 @@ async function resolveMentorIdFromReq(req: Request): Promise<string> {
     }
 }
 
-// Endpoint para obtener NPS de un mentor
-app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) => {
+async function findMentorByEmail(email: string) {
+    const cleanEmail = email.trim().toLowerCase();
+    const mentorsDb = process.env.NOTION_MENTORS_DATABASE_ID || '';
+
+    if (!mentorsDb) {
+        throw new Error('Falta NOTION_MENTORS_DATABASE_ID');
+    }
+
+    const result = await notion.databases.query({
+        database_id: mentorsDb,
+        filter: {
+            property: 'Correo',
+            email: {
+                equals: cleanEmail,
+            },
+        },
+    });
+
+    if (!result.results?.length) {
+        throw new Error(`Mentor no encontrado para el email: ${cleanEmail}`);
+    }
+
+    return result.results[0] as any;
+}
+
+async function detectMentorCurrentRoleByNotionId(mentorId: string): Promise<'teacher' | 'assistant' | null> {
+    const cohortsDb = process.env.NOTION_COHORTS_DATABASE_ID || process.env.NOTION_DATABASE_ID || '';
+    if (!cohortsDb) {
+        return null;
+    }
+
+    const [taDirect, taRollup, teacherDirect, teacherRollup] = await Promise.allSettled([
+        notion.databases.query({
+            database_id: cohortsDb,
+            filter: {
+                property: 'T.A.',
+                relation: { contains: mentorId }
+            },
+            page_size: 1
+        }),
+        notion.databases.query({
+            database_id: cohortsDb,
+            filter: {
+                property: 'T.A.',
+                rollup: {
+                    any: {
+                        relation: { contains: mentorId }
+                    }
+                }
+            },
+            page_size: 1
+        }),
+        notion.databases.query({
+            database_id: cohortsDb,
+            filter: {
+                property: 'Teacher',
+                relation: { contains: mentorId }
+            },
+            page_size: 1
+        }),
+        notion.databases.query({
+            database_id: cohortsDb,
+            filter: {
+                property: 'Teacher',
+                rollup: {
+                    any: {
+                        relation: { contains: mentorId }
+                    }
+                }
+            },
+            page_size: 1
+        }),
+    ]);
+
+    const hasAssistantAssignments = [taDirect, taRollup].some((result) =>
+        result.status === 'fulfilled' && (result.value.results?.length || 0) > 0
+    );
+    const hasTeacherAssignments = [teacherDirect, teacherRollup].some((result) =>
+        result.status === 'fulfilled' && (result.value.results?.length || 0) > 0
+    );
+
+    if (hasTeacherAssignments) return 'teacher';
+    if (hasAssistantAssignments) return 'assistant';
+    return null;
+}
+
+async function resolveRequestedMentor(req: Request) {
+    const requestedEmail = typeof req.body?.email === 'string'
+        ? req.body.email.trim().toLowerCase()
+        : typeof req.query?.email === 'string'
+            ? req.query.email.trim().toLowerCase()
+            : '';
+    const requestedMemberIdRaw = typeof req.body?.memberId === 'string'
+        ? req.body.memberId
+        : typeof req.query?.memberId === 'string'
+            ? req.query.memberId
+            : '';
+    const requestedMemberId = requestedMemberIdRaw.trim();
+    const roles = (req as any).user4GeeksData?.roles || [];
+    const canImpersonate = hasAllowedAcademyRole(roles, ['academy_coordinator', 'admin']);
+
+    if (requestedEmail && canImpersonate) {
+        const page = await findMentorByEmail(requestedEmail);
+        const name =
+            page.properties?.Name?.title?.[0]?.plain_text ||
+            page.properties?.Title?.title?.[0]?.plain_text ||
+            requestedEmail;
+        const effectiveRole = await detectMentorCurrentRoleByNotionId(page.id);
+
+        return {
+            id: page.id,
+            email: requestedEmail,
+            name: name?.trim() || requestedEmail,
+            isImpersonated: true,
+            effectiveRole,
+            memberId: requestedMemberId || null,
+        };
+    }
+
+    const mentorId = await resolveMentorIdFromReq(req);
+    const userData = (req as any).user4GeeksData;
+    const mentorName = userData?.first_name && userData?.last_name
+        ? `${userData.first_name} ${userData.last_name}`
+        : userData?.username || 'Mentor';
+
+    return {
+        id: mentorId,
+        email: userData?.email || null,
+        name: mentorName,
+        isImpersonated: false,
+        effectiveRole: hasAllowedAcademyRole(userData?.roles || [], ['teacher'])
+            ? 'teacher'
+            : hasAllowedAcademyRole(userData?.roles || [], ['assistant'])
+                ? 'assistant'
+                : null,
+        memberId: null,
+    };
+}
+
+async function fetchJsonWithToken(
+    url: string,
+    token: string,
+    options: {
+        method?: string;
+        body?: any;
+        academy?: string | number | null;
+    } = {}
+) {
+    const { method = 'GET', body, academy } = options;
+    const response = await fetch(url, {
+        method,
+        headers: {
+            Authorization: `Token ${token}`,
+            ...(academy !== undefined && academy !== null ? { Academy: String(academy) } : {}),
+            ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+        },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+
+    if (!response.ok) {
+        throw new Error(`Request failed: ${response.status} ${response.statusText} | ${await response.text()}`);
+    }
+
+    return response.json() as Promise<any>;
+}
+
+function normalizeCollectionPayload(payload: any): any[] {
+    if (Array.isArray(payload)) return payload;
+    if (Array.isArray(payload?.results)) return payload.results;
+    if (Array.isArray(payload?.items)) return payload.items;
+    if (Array.isArray(payload?.data)) return payload.data;
+    return [];
+}
+
+function extractEmailFromMember(member: any): string {
+    return String(
+        member?.email ||
+        member?.user?.email ||
+        member?.user_email ||
+        member?.username ||
+        ''
+    ).trim().toLowerCase();
+}
+
+function extractMemberId(member: any): string | null {
+    const rawId =
+        member?.id ||
+        member?.user?.id ||
+        member?.user_id ||
+        member?.member_id ||
+        null;
+
+    if (rawId === null || rawId === undefined) return null;
+    return String(rawId);
+}
+
+async function resolveBreathcodeMemberIdByEmail(operatorToken: string, email: string): Promise<string> {
+    const apiUrl = process.env.BREATHCODE_API_URL;
+    if (!apiUrl) {
+        throw new Error('BREATHCODE_API_URL no está configurado en las variables de entorno');
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const cachedMemberId = getCachedValue(breathcodeMemberIdCache, cleanEmail);
+    if (cachedMemberId) {
+        return cachedMemberId;
+    }
+
+    const pendingLookup = pendingBreathcodeMemberIdLookups.get(cleanEmail);
+    if (pendingLookup) {
+        return pendingLookup;
+    }
+
+    const lookupPromise = (async () => {
+        let userId: string | null = null;
+
+        for (const url of [
+            `${apiUrl}/auth/user?email=${encodeURIComponent(cleanEmail)}`,
+            `${apiUrl}/auth/user?like=${encodeURIComponent(cleanEmail)}`,
+        ]) {
+            try {
+                const payload = await fetchJsonWithToken(url, operatorToken);
+                const exactMatch = normalizeCollectionPayload(payload).find((item) => {
+                    return extractEmailFromMember(item) === cleanEmail;
+                });
+                userId = extractMemberId(exactMatch);
+                if (userId) {
+                    break;
+                }
+            } catch (error) {
+                continue;
+            }
+        }
+
+        if (!userId) {
+            throw new Error(`No se pudo resolver el user id de BreatheCode para ${cleanEmail}`);
+        }
+
+        for (const academyId of ALLOWED_ACADEMY_IDS) {
+            try {
+                const payload = await fetchJsonWithToken(
+                    `${apiUrl}/auth/academy/${academyId}/member/${userId}`,
+                    operatorToken,
+                    { academy: academyId }
+                );
+                const payloadEmail = extractEmailFromMember(payload);
+                const memberId = extractMemberId(payload);
+                if (memberId && (!payloadEmail || payloadEmail === cleanEmail)) {
+                    return setCachedValue(breathcodeMemberIdCache, cleanEmail, memberId);
+                }
+            } catch (error) {
+                continue;
+            }
+        }
+
+        throw new Error(`No se pudo resolver el member id de BreatheCode para ${cleanEmail}`);
+    })();
+
+    pendingBreathcodeMemberIdLookups.set(cleanEmail, lookupPromise);
+
     try {
-        const { mentorId: mentorIdFromBody, startDate, endDate, includePast = true } = req.body;
+        return await lookupPromise;
+    } finally {
+        pendingBreathcodeMemberIdLookups.delete(cleanEmail);
+    }
+}
+
+async function resolveBreathcodeMentorNameVariantsByEmail(operatorToken: string, email: string): Promise<string[]> {
+    const apiUrl = process.env.BREATHCODE_API_URL;
+    if (!apiUrl) {
+        throw new Error('BREATHCODE_API_URL no estÃ¡ configurado en las variables de entorno');
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    let exactUser: any = null;
+
+    for (const url of [
+        `${apiUrl}/auth/user?email=${encodeURIComponent(cleanEmail)}`,
+        `${apiUrl}/auth/user?like=${encodeURIComponent(cleanEmail)}`,
+    ]) {
+        try {
+            const payload = await fetchJsonWithToken(url, operatorToken);
+            exactUser = normalizeCollectionPayload(payload).find((item) => {
+                return extractEmailFromMember(item) === cleanEmail;
+            });
+            if (exactUser) {
+                break;
+            }
+        } catch (error) {
+            continue;
+        }
+    }
+
+    const userId = extractMemberId(exactUser);
+    const fallbackName = [
+        exactUser?.first_name,
+        exactUser?.last_name,
+    ].filter(Boolean).join(' ');
+
+    if (!userId) {
+        return getMentorNameVariants(fallbackName, email);
+    }
+
+    for (const academyId of ALLOWED_ACADEMY_IDS) {
+        try {
+            const memberPayload = await fetchJsonWithToken(
+                `${apiUrl}/auth/academy/${academyId}/member/${userId}`,
+                operatorToken,
+                { academy: academyId }
+            );
+
+            return getMentorNameVariants(
+                `${memberPayload?.first_name || ''} ${memberPayload?.last_name || ''}`,
+                `${memberPayload?.user?.first_name || ''} ${memberPayload?.user?.last_name || ''}`,
+                fallbackName,
+                email
+            );
+        } catch (error) {
+            continue;
+        }
+    }
+
+    return getMentorNameVariants(fallbackName, email);
+}
+
+async function fetchImpersonatedBreathcodeToken(
+    operatorToken: string,
+    email: string,
+    memberIdOverride?: string | null
+): Promise<string> {
+    const apiUrl = process.env.BREATHCODE_API_URL;
+    if (!apiUrl) {
+        throw new Error('BREATHCODE_API_URL no está configurado en las variables de entorno');
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const cachedToken = getCachedValue(breathcodeImpersonationTokenCache, cleanEmail);
+    if (cachedToken) {
+        return cachedToken;
+    }
+
+    const pendingLookup = pendingBreathcodeTokenLookups.get(cleanEmail);
+    if (pendingLookup) {
+        return pendingLookup;
+    }
+
+    const lookupPromise = (async () => {
+        const memberId = memberIdOverride?.trim() || await resolveBreathcodeMemberIdByEmail(operatorToken, cleanEmail);
+        const tokenEndpoint = `${apiUrl}/auth/member/${memberId}/token`;
+        let lastError: any = null;
+
+        const academyCandidates = [...new Set(ALLOWED_ACADEMY_IDS.map(String))];
+        for (const academyId of academyCandidates) {
+            try {
+                const payload = await fetchJsonWithToken(
+                    tokenEndpoint,
+                    operatorToken,
+                    { method: 'POST', academy: academyId }
+                );
+                const impersonatedToken = payload?.key || payload?.token || null;
+                if (impersonatedToken) {
+                    return setCachedValue(
+                        breathcodeImpersonationTokenCache,
+                        cleanEmail,
+                        String(impersonatedToken),
+                        IMPERSONATION_TOKEN_CACHE_TTL_MS
+                    );
+                }
+            } catch (error: any) {
+                lastError = error;
+            }
+        }
+
+        try {
+            const payload = await fetchJsonWithToken(
+                tokenEndpoint,
+                operatorToken,
+                { method: 'POST' }
+            );
+            const impersonatedToken = payload?.key || payload?.token || null;
+            if (impersonatedToken) {
+                return setCachedValue(
+                    breathcodeImpersonationTokenCache,
+                    cleanEmail,
+                    String(impersonatedToken),
+                    IMPERSONATION_TOKEN_CACHE_TTL_MS
+                );
+            }
+        } catch (error: any) {
+            lastError = error;
+        }
+
+        if (lastError) {
+            throw lastError;
+        }
+
+        throw new Error(`No se recibió token de impersonación para ${cleanEmail}`);
+    })();
+
+    pendingBreathcodeTokenLookups.set(cleanEmail, lookupPromise);
+
+    try {
+        return await lookupPromise;
+    } finally {
+        pendingBreathcodeTokenLookups.delete(cleanEmail);
+    }
+}
+
+function getRequestImpersonationToken(req: Request): string | null {
+    const headerValue = req.headers['x-impersonation-token'];
+    const token = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+
+    if (typeof token !== 'string') {
+        return null;
+    }
+
+    const cleanToken = token.trim();
+    return cleanToken || null;
+}
+
+// Endpoint para obtener NPS de un mentor
+app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
+    try {
+        const {
+            mentorId: mentorIdFromBody,
+            startDate,
+            endDate,
+            includePast = true,
+            summaryOnly = false,
+        } = req.body;
+        const requestedMentor = await resolveRequestedMentor(req);
 
         let mentorId: string | undefined = undefined;
 
@@ -1678,14 +2356,14 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             }
         }
 
-        // Si no se proporciona mentorId en el body, intentar resolverlo desde el token
+        // Si no se proporciona mentorId en el body, intentar resolverlo desde el contexto actual
         if (!mentorId) {
             try {
-                mentorId = await resolveMentorIdFromReq(req);
+                mentorId = requestedMentor.id;
             } catch (error: any) {
                 console.error('❌ [mentor-nps] Error resolviendo mentorId:', {
                     error: error.message,
-                    email: (req as any).user4GeeksData?.email
+                    email: requestedMentor.email || (req as any).user4GeeksData?.email
                 });
                 return res.status(400).json({
                     error: 'Error resolviendo mentorId',
@@ -1738,20 +2416,35 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
         const originalMentorId = mentorId;
         // Normalizar UUID removiendo guiones para comparaciones en código
         const normalizedMentorId = mentorId.replace(/-/g, '');
+        const mentorNpsCacheKey = buildCacheKey(
+            'mentor-nps',
+            requestedMentor.email,
+            originalMentorId,
+            startDate,
+            endDate,
+            includePast,
+            summaryOnly
+        );
+        const cachedMentorNpsResponse = getCachedValue(mentorNpsResponseCache, mentorNpsCacheKey);
+        if (cachedMentorNpsResponse) {
+            return res.status(200).json(cachedMentorNpsResponse);
+        }
 
         const NPS_DB = process.env.NOTION_NPS_DATABASE_ID || '';
         if (!NPS_DB) {
             return res.status(500).json({ error: 'Falta NOTION_NPS_DATABASE_ID en variables de entorno' });
         }
 
-        // Determinar el rol del usuario autenticado
         const userRoles = (req as any).user4GeeksData?.roles || [];
-        const isAssistant = userRoles.some((roleObj: any) =>
-            roleObj.role === 'assistant' && roleObj.academy && ALLOWED_ACADEMY_IDS.includes(roleObj.academy.id)
-        );
-        const isTeacher = userRoles.some((roleObj: any) =>
-            roleObj.role === 'teacher' && roleObj.academy && ALLOWED_ACADEMY_IDS.includes(roleObj.academy.id)
-        );
+        const fallbackRole = hasAllowedAcademyRole(userRoles, ['teacher'])
+            ? 'teacher'
+            : hasAllowedAcademyRole(userRoles, ['assistant'])
+                ? 'assistant'
+                : null;
+        let effectiveRole: 'teacher' | 'assistant' | null =
+            requestedMentor.effectiveRole === 'teacher' || requestedMentor.effectiveRole === 'assistant'
+                ? requestedMentor.effectiveRole
+                : fallbackRole;
 
         const COHORTS_DB_FOR_EVALS_SEARCH = process.env.NOTION_COHORTS_DATABASE_ID || process.env.NOTION_DATABASE_ID || '';
         if (!COHORTS_DB_FOR_EVALS_SEARCH) {
@@ -1772,6 +2465,9 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             const allMentorCohortPages = new Map<string, any>();
 
             try {
+                let hasAssistantAssignments = false;
+                let hasTeacherAssignments = false;
+
                 // Ejecutar las 4 consultas en paralelo para reducir latencia
                 const [taDirectResult, taRollupResult, teacherDirectResult, teacherRollupResult] = await Promise.allSettled([
                     notion.databases.query({
@@ -1824,6 +2520,21 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                     teacherRollupResult.status === 'fulfilled' ? teacherRollupResult.value.results || [] : []
                 ].flat();
 
+                hasAssistantAssignments =
+                    (taDirectResult.status === 'fulfilled' ? taDirectResult.value.results?.length || 0 : 0) > 0 ||
+                    (taRollupResult.status === 'fulfilled' ? taRollupResult.value.results?.length || 0 : 0) > 0;
+                hasTeacherAssignments =
+                    (teacherDirectResult.status === 'fulfilled' ? teacherDirectResult.value.results?.length || 0 : 0) > 0 ||
+                    (teacherRollupResult.status === 'fulfilled' ? teacherRollupResult.value.results?.length || 0 : 0) > 0;
+
+                if (!effectiveRole) {
+                    effectiveRole = hasTeacherAssignments
+                        ? 'teacher'
+                        : hasAssistantAssignments
+                            ? 'assistant'
+                            : fallbackRole;
+                }
+
                 // Guardar IDs y páginas para evitar consultas posteriores
                 allResults.forEach((page: any) => {
                     allMentorCohortIds.add(page.id);
@@ -1840,38 +2551,41 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             if (foundCohortIdsInSearch) {
                 const cohortIdsArray = Array.from(allMentorCohortIds);
                 const BATCH_SIZE = 10;
+                const cohortBatches = chunkArray(cohortIdsArray, BATCH_SIZE);
+                const batchResultsList = await mapWithConcurrency(
+                    cohortBatches,
+                    3,
+                    async (batch) => {
+                        const cohortFilter: any = {
+                            or: batch.map(cohortId => ({
+                                property: 'Cohorts',
+                                relation: { contains: cohortId }
+                            }))
+                        };
 
-                for (let i = 0; i < cohortIdsArray.length; i += BATCH_SIZE) {
-                    const batch = cohortIdsArray.slice(i, i + BATCH_SIZE);
-                    const cohortFilter: any = {
-                        or: batch.map(cohortId => ({
-                            property: 'Cohorts',
-                            relation: { contains: cohortId }
-                        }))
-                    };
+                        let finalFilter: any = cohortFilter;
+                        if (startDate || endDate) {
+                            const dateFilters: any[] = [];
+                            if (startDate) {
+                                dateFilters.push({
+                                    property: 'NPS ID',
+                                    title: { starts_with: startDate.substring(0, 7) }
+                                });
+                            }
+                            if (endDate) {
+                                dateFilters.push({
+                                    property: 'NPS ID',
+                                    title: { starts_with: endDate.substring(0, 7) }
+                                });
+                            }
+                            finalFilter = { and: [cohortFilter, ...dateFilters] };
+                        }
 
-                    // Añadir filtros de fecha si se proporcionan
-                    let finalFilter: any = cohortFilter;
-                    if (startDate || endDate) {
-                        const dateFilters: any[] = [];
-                        if (startDate) {
-                            dateFilters.push({
-                                property: 'NPS ID',
-                                title: { starts_with: startDate.substring(0, 7) }
-                            });
-                        }
-                        if (endDate) {
-                            dateFilters.push({
-                                property: 'NPS ID',
-                                title: { starts_with: endDate.substring(0, 7) }
-                            });
-                        }
-                        finalFilter = { and: [cohortFilter, ...dateFilters] };
+                        return notionQueryAll(NPS_DB, finalFilter);
                     }
+                );
 
-                    const batchResults = await notionQueryAll(NPS_DB, finalFilter);
-                    allPages.push(...batchResults);
-                }
+                allPages.push(...batchResultsList.flat());
 
                 // Eliminar duplicados (una evaluación puede estar relacionada a múltiples cohortes)
                 const uniquePageIds = new Set();
@@ -1893,7 +2607,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             if (allPages.length === 0 && !foundCohortIdsInSearch) {
                 const fallbackPages = new Set<string>();
 
-                if (isAssistant) {
+                if (effectiveRole === 'assistant') {
                     // Intentar T.A. directo
                     try {
                         const taDirectFilter: any = { property: 'T.A.', relation: { contains: originalMentorId } };
@@ -1971,14 +2685,18 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
 
                 // Convertir Set a Array
                 if (fallbackPages.size > 0) {
-                    for (const pageId of fallbackPages) {
-                        try {
-                            const page = await notion.pages.retrieve({ page_id: pageId });
-                            allPages.push(page);
-                        } catch (error) {
-                            // Continuar si no se puede obtener la página
+                    const fallbackRetrievedPages = await mapWithConcurrency(
+                        Array.from(fallbackPages),
+                        5,
+                        async (pageId) => {
+                            try {
+                                return await notion.pages.retrieve({ page_id: pageId });
+                            } catch (error) {
+                                return null;
+                            }
                         }
-                    }
+                    );
+                    allPages.push(...fallbackRetrievedPages.filter(Boolean) as any[]);
                 }
             }
         } catch (error: any) {
@@ -1989,9 +2707,9 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             });
         }
 
-        // Filtrar evaluaciones que realmente corresponden al mentor actual
-        // IMPORTANTE: Verificar tanto TA como Teacher en cada evaluación, ya que el mentor
-        // puede ser TA en unas evaluaciones y Teacher en otras de la misma cohorte
+        // Filtrar evaluaciones que realmente corresponden al mentor actual.
+        // Si el mentor hoy es teacher, priorizamos solo evaluaciones teacher.
+        // Si hoy es assistant, priorizamos solo evaluaciones TA.
         const pages: any[] = [];
         const skippedEvaluations: any[] = [];
 
@@ -2010,12 +2728,12 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             const teacherIds = teacherRelation.map((t: any) => t.id);
             const normalizedTeacherIds = teacherIds.map((id: string) => id.replace(/-/g, ''));
 
-            // Si está como TA, incluirlo
-            if (isMentorTA) {
+            // Si el rol efectivo actual es assistant, solo incluir evaluaciones TA
+            if (effectiveRole === 'assistant' && isMentorTA) {
                 pages.push(page);
             }
-            // Si está como Teacher, verificar responsabilidad
-            else if (normalizedTeacherIds.includes(normalizedMentorId)) {
+            // Si el rol efectivo actual es teacher, solo incluir evaluaciones teacher
+            else if (effectiveRole === 'teacher' && normalizedTeacherIds.includes(normalizedMentorId)) {
                 const mentorChangeDate = props['Mentor Change Date']?.rollup?.array?.[0]?.date?.start || null;
 
                 // Extraer fecha de evaluación
@@ -2043,11 +2761,47 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                         teacherIds
                     });
                 }
+            } else if (!effectiveRole) {
+                if (isMentorTA) {
+                    pages.push(page);
+                } else if (normalizedTeacherIds.includes(normalizedMentorId)) {
+                    const mentorChangeDate = props['Mentor Change Date']?.rollup?.array?.[0]?.date?.start || null;
+                    const evaluationDate = props['Date of Creation']?.date?.start ||
+                        props['Date of Creation']?.rich_text?.[0]?.plain_text ||
+                        page.created_time ||
+                        props['NPS ID']?.title?.[0]?.plain_text || '';
+
+                    const responsibility = isMentorResponsibleForEvaluation(
+                        evaluationDate,
+                        mentorChangeDate,
+                        teacherIds,
+                        normalizedMentorId
+                    );
+
+                    if (responsibility.isResponsible) {
+                        pages.push(page);
+                    } else {
+                        skippedEvaluations.push({
+                            npsId,
+                            reason: responsibility.reason,
+                            evaluationDate,
+                            mentorChangeDate,
+                            teacherIds
+                        });
+                    }
+                } else {
+                    skippedEvaluations.push({
+                        npsId,
+                        reason: 'Mentor no está como TA ni como Teacher en la evaluación',
+                        evaluationDate: props['Date of Creation']?.date?.start || page.created_time,
+                        mentorChangeDate: null,
+                        teacherIds
+                    });
+                }
             } else {
-                // No está ni como TA ni como Teacher
                 skippedEvaluations.push({
                     npsId,
-                    reason: 'Mentor no está como TA ni como Teacher en la evaluación',
+                    reason: `Evaluación omitida por rol efectivo actual (${effectiveRole})`,
                     evaluationDate: props['Date of Creation']?.date?.start || page.created_time,
                     mentorChangeDate: null,
                     teacherIds
@@ -2055,54 +2809,8 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             }
         }
 
-        // Obtener comentarios solo para las evaluaciones asignadas
+        // Los comentarios se cargan bajo demanda desde /api/nps-comments
         const commentsMap = new Map<string, any[]>();
-
-        for (const page of pages) {
-            const props = (page as any).properties || {};
-            const npsId = props['NPS ID']?.title?.[0]?.plain_text || '';
-
-            if (npsId) {
-                try {
-                    const notionPageId = page.id;
-                    const commentsResponse = await notion.comments.list({
-                        block_id: notionPageId,
-                    });
-
-                    if (commentsResponse.results && commentsResponse.results.length > 0) {
-                        // Tomar solo el primer comentario
-                        const firstComment = commentsResponse.results[0];
-                        const firstCommentText = firstComment.rich_text?.[0]?.plain_text || '';
-
-                        // Enriquecer el primer comentario con información del autor
-                        try {
-                            const authorId = firstComment.created_by?.id;
-                            if (authorId) {
-                                const author = await notion.users.retrieve({ user_id: authorId });
-                                const enrichedComment = {
-                                    ...firstComment,
-                                    author: {
-                                        id: author.id,
-                                        name: author.name,
-                                        avatar_url: author.avatar_url,
-                                        type: author.type
-                                    }
-                                };
-                                commentsMap.set(npsId, [enrichedComment]);
-                            } else {
-                                commentsMap.set(npsId, [firstComment]);
-                            }
-                        } catch (error) {
-                            commentsMap.set(npsId, [firstComment]);
-                        }
-                    } else {
-                        commentsMap.set(npsId, []);
-                    }
-                } catch (error) {
-                    commentsMap.set(npsId, []);
-                }
-            }
-        }
 
         // Agrupar por cohorte
         const byCohort = new Map<string, {
@@ -2134,6 +2842,8 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             }
         };
 
+        const taNameCache = new Map<string, { id: string; name: string }>();
+
         // Procesar solo las evaluaciones asignadas al mentor
         for (const page of pages) {
             const props = (page as any).properties || {};
@@ -2159,8 +2869,8 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                 page.created_time ||
                 npsId;
 
-            // Para assistants, no aplicar validaciones de cambio de mentor
-            if (!isAssistant) {
+            // Para teacher sí aplicamos validaciones de cambio de mentor
+            if (effectiveRole !== 'assistant') {
                 // Validar datos de cambio de mentor (solo para teachers)
                 const validation = validateMentorChangeData(teacherIds, mentorChangeDate, evaluationDate);
                 if (!validation.isValid) {
@@ -2220,11 +2930,17 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                             return { id: 'unknown', name: 'TA sin ID' };
                         }
 
+                        if (taNameCache.has(taId)) {
+                            return taNameCache.get(taId)!;
+                        }
+
                         const taPage = await notion.pages.retrieve({ page_id: taId });
                         const taName = (taPage as any).properties?.Name?.title?.[0]?.plain_text ||
                             (taPage as any).properties?.Title?.title?.[0]?.plain_text ||
                             'TA sin nombre';
-                        return { id: taId, name: taName };
+                        const taData = { id: taId, name: taName };
+                        taNameCache.set(taId, taData);
+                        return taData;
                     } catch (error) {
                         return { id: ta.id || ta.relation?.id || 'unknown', name: 'TA no encontrado' };
                     }
@@ -2419,7 +3135,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
 
         // Métricas generales del mentor
         let allScores: number[];
-        if (isAssistant) {
+        if (effectiveRole === 'assistant') {
             // Para assistants, usar TA Score
             allScores = Array.from(byCohort.values())
                 .flatMap(x => x.items.map(i => i.taScores))
@@ -2433,15 +3149,105 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
 
         const overall = computeNps(allScores);
 
-        // Obtener nombre del mentor
-        let mentorName = 'Mentor';
-        try {
-            const mentorPage = await notion.pages.retrieve({ page_id: mentorId });
-            mentorName = (mentorPage as any).properties?.Name?.title?.[0]?.plain_text ||
-                (mentorPage as any).properties?.Title?.title?.[0]?.plain_text ||
-                'Mentor';
-        } catch (error) {
-            // Silently handle error getting mentor name
+        const mentorName = requestedMentor.name || 'Mentor';
+        const baseKpis = {
+            overallTeacherAverage: overall.avg,
+            overallCohortAverage: Array.from(byCohort.values())
+                .flatMap(x => x.items.map(i => i.cohortScore))
+                .filter(s => s > 0)
+                .reduce((a, b) => a + b, 0) /
+                Array.from(byCohort.values())
+                    .flatMap(x => x.items.map(i => i.cohortScore))
+                    .filter(s => s > 0).length || 0,
+            overallTAAverage: Array.from(byCohort.values())
+                .flatMap(x => x.items.map(i => i.taScores))
+                .filter(s => s > 0)
+                .reduce((a, b) => a + b, 0) /
+                Array.from(byCohort.values())
+                    .flatMap(x => x.items.map(i => i.taScores))
+                    .filter(s => s > 0).length || 0,
+            totalEvaluations: pages.length,
+            totalCohorts: resultActive.length + resultPast.length,
+            activeCohorts: resultActive.length,
+            finishedCohorts: resultPast.length,
+            averageParticipation: Array.from(byCohort.values())
+                .flatMap(x => x.items.map(i => i.participation))
+                .filter(p => p > 0)
+                .reduce((a, b) => a + b, 0) /
+                Array.from(byCohort.values())
+                    .flatMap(x => x.items.map(i => i.participation))
+                    .filter(p => p > 0).length || 0,
+            scoreType: effectiveRole === 'assistant' ? 'TA Score' : 'Teacher Score'
+        };
+        const baseMetadata = {
+            mentorId: originalMentorId,
+            mentorName,
+            lastUpdated: new Date().toISOString(),
+            dataPoints: {
+                totalEvaluations: pages.length,
+                totalCohorts: resultActive.length + resultPast.length,
+                activeCohorts: resultActive.length,
+                pastCohorts: resultPast.length
+            }
+        };
+        const mentorChangeValidation = {
+            totalEvaluationsFound: validationStats.totalEvaluations,
+            evaluationsAssigned: validationStats.assignedEvaluations,
+            evaluationsSkipped: validationStats.skippedEvaluations,
+            warnings: validationStats.warnings,
+            mentorChanges: validationStats.mentorChanges,
+            skippedEvaluationsDetails: skippedEvaluations.map(skip => ({
+                npsId: skip.npsId,
+                reason: skip.reason,
+                evaluationDate: skip.evaluationDate,
+                mentorChangeDate: skip.mentorChangeDate,
+                teacherIds: skip.teacherIds
+            })),
+            summary: {
+                hasMentorChanges: validationStats.mentorChanges.total > 0,
+                hasWarnings: validationStats.warnings.length > 0,
+                assignmentAccuracy: validationStats.totalEvaluations > 0 ?
+                    Math.round((validationStats.assignedEvaluations / validationStats.totalEvaluations) * 100) : 0
+            }
+        };
+
+        if (summaryOnly) {
+            const summaryPayload = {
+                activeCohorts: [],
+                pastCohorts: [],
+                overall: {
+                    teacherAverage: overall.avg,
+                    totalEvaluations: overall.count,
+                    scoreType: effectiveRole === 'assistant' ? 'TA Score' : 'Teacher Score'
+                },
+                totalCohorts: resultActive.length + resultPast.length,
+                totalEvaluations: validationStats.assignedEvaluations,
+                mentorId: originalMentorId,
+                mentorName,
+                userRole: effectiveRole || 'teacher',
+                effectiveRole,
+                visualizationData: {
+                    cohorts: [],
+                    charts: {
+                        averagesByCohort: [],
+                        participationByCohort: []
+                    },
+                    tables: {
+                        cohorts: [],
+                        recentEvaluations: []
+                    },
+                    kpis: baseKpis,
+                    metadata: baseMetadata
+                },
+                totalComments: 0,
+                impersonated: requestedMentor.isImpersonated,
+                requestedEmail: requestedMentor.email,
+                mentorChangeValidation,
+                summaryOnly: true
+            };
+
+            setCachedValue(mentorNpsResponseCache, mentorNpsCacheKey, summaryPayload, MENTOR_RESPONSE_CACHE_TTL_MS);
+            return res.status(200).json(summaryPayload);
         }
 
         // Organizar datos para visualización por cohorte
@@ -2595,7 +3401,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
 
             // Datos para KPIs
             kpis: {
-                overallTeacherAverage: overall.avg, // Ahora puede ser TA o Teacher según el rol
+                overallTeacherAverage: overall.avg, // Ahora puede ser TA o Teacher según el rol efectivo
                 overallCohortAverage: Array.from(byCohort.values())
                     .flatMap(x => x.items.map(i => i.cohortScore))
                     .filter(s => s > 0)
@@ -2621,7 +3427,7 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                     Array.from(byCohort.values())
                         .flatMap(x => x.items.map(i => i.participation))
                         .filter(p => p > 0).length || 0,
-                scoreType: isAssistant ? 'TA Score' : 'Teacher Score' // Añadir tipo de score
+                scoreType: effectiveRole === 'assistant' ? 'TA Score' : 'Teacher Score' // Añadir tipo de score
             },
 
             // Metadatos
@@ -2672,21 +3478,24 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
             }
         };
 
-        res.status(200).json({
+        const responsePayload = {
             activeCohorts: resultActive,
             pastCohorts: resultPast,
             overall: {
                 teacherAverage: overall.avg,
                 totalEvaluations: overall.count,
-                scoreType: isAssistant ? 'TA Score' : 'Teacher Score'
+                scoreType: effectiveRole === 'assistant' ? 'TA Score' : 'Teacher Score'
             },
             totalCohorts: resultActive.length + resultPast.length,
             totalEvaluations: validationStats.assignedEvaluations,
             mentorId: originalMentorId,
             mentorName,
-            userRole: isAssistant ? 'assistant' : 'teacher',
+            userRole: effectiveRole || 'teacher',
+            effectiveRole,
             visualizationData: safeVisualizationData,
             totalComments: Array.from(commentsMap.values()).flat().length,
+            impersonated: requestedMentor.isImpersonated,
+            requestedEmail: requestedMentor.email,
             mentorChangeValidation: {
                 totalEvaluationsFound: validationStats.totalEvaluations,
                 evaluationsAssigned: validationStats.assignedEvaluations,
@@ -2707,7 +3516,11 @@ app.post('/api/mentor-nps', authorizeTeachersOrAssistants(), async (req, res) =>
                         Math.round((validationStats.assignedEvaluations / validationStats.totalEvaluations) * 100) : 0
                 }
             }
-        });
+        };
+
+        setCachedValue(mentorNpsResponseCache, mentorNpsCacheKey, responsePayload, MENTOR_RESPONSE_CACHE_TTL_MS);
+
+        res.status(200).json(responsePayload);
 
     } catch (err: any) {
         console.error('Error obteniendo NPS del mentor:', err);
@@ -2775,6 +3588,8 @@ app.put('/api/mentor-nps/evaluation-seen', authorizeTeachersOrAssistants(), asyn
         if (!updateResponse) {
             return res.status(500).json({ error: 'Error al actualizar la evaluación' });
         }
+
+        clearMentorDataCaches();
 
         res.status(200).json({
             message: 'Estado de evaluación actualizado correctamente',
@@ -3520,6 +4335,35 @@ app.get('/api/mentors/me', authorizeTeachersOrAssistants(), async (req, res) => 
     }
 });
 
+app.post('/api/mentors/preview-by-email', authorizeCoordinatorOrAdmin(), async (req, res) => {
+    try {
+        const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+        if (!email) {
+            return res.status(400).json({ error: 'Se requiere email' });
+        }
+
+        const page = await findMentorByEmail(email);
+        const name =
+            page.properties?.Name?.title?.[0]?.plain_text ||
+            page.properties?.Title?.title?.[0]?.plain_text ||
+            email;
+        const effectiveRole = await detectMentorCurrentRoleByNotionId(page.id);
+
+        res.status(200).json({
+            id: page.id,
+            email,
+            name: name?.trim() || email,
+            effectiveRole,
+            memberId: null,
+        });
+    } catch (error: any) {
+        res.status(404).json({
+            error: 'Mentor no encontrado',
+            details: error.message,
+        });
+    }
+});
+
 function isISODateString(dateStr: string) {
     // Verifica si el string es un ISO 8601 válido (YYYY-MM-DDTHH:mm o similar)
     return typeof dateStr === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(dateStr);
@@ -3529,74 +4373,73 @@ function isISODateString(dateStr: string) {
  * Helper: Obtiene el nombre de un estudiante desde Notion usando su ID
  */
 async function getStudentNameFromNotion(studentId: string): Promise<string> {
+    const cachedName = getCachedValue(studentNameCache, studentId);
+    if (cachedName) {
+        return cachedName;
+    }
+
+    const pendingLookup = pendingStudentNameLookups.get(studentId);
+    if (pendingLookup) {
+        return pendingLookup;
+    }
+
+    const lookupPromise = (async () => {
+        try {
+            const studentPage = await notion.pages.retrieve({
+                page_id: studentId
+            });
+
+            const properties = (studentPage as any).properties;
+            const propertyKeys = Object.keys(properties || {});
+
+            if (properties?.Student) {
+                const studentProp = properties.Student;
+
+                if (studentProp?.type === 'title' && studentProp?.title?.[0]?.plain_text) {
+                    const name = studentProp.title[0].plain_text.trim();
+                    if (name) {
+                        return setCachedValue(studentNameCache, studentId, name);
+                    }
+                }
+
+                if (studentProp?.type === 'rich_text' && studentProp?.rich_text?.[0]?.plain_text) {
+                    const name = studentProp.rich_text[0].plain_text.trim();
+                    if (name) {
+                        return setCachedValue(studentNameCache, studentId, name);
+                    }
+                }
+
+                if (studentProp?.type === 'formula' && studentProp?.formula?.string) {
+                    const name = studentProp.formula.string.trim();
+                    if (name) {
+                        return setCachedValue(studentNameCache, studentId, name);
+                    }
+                }
+            }
+
+            for (const key of propertyKeys) {
+                const prop = properties[key];
+                if (prop?.type === 'title' && prop?.title?.[0]?.plain_text) {
+                    const name = prop.title[0].plain_text.trim();
+                    if (name) {
+                        return setCachedValue(studentNameCache, studentId, name);
+                    }
+                }
+            }
+
+            return setCachedValue(studentNameCache, studentId, 'Estudiante desconocido');
+        } catch (error: any) {
+            console.error(`⚠️ [getStudentNameFromNotion] Error obteniendo estudiante ${studentId}:`, error.message);
+            return setCachedValue(studentNameCache, studentId, 'Estudiante desconocido', 60 * 1000);
+        }
+    })();
+
+    pendingStudentNameLookups.set(studentId, lookupPromise);
+
     try {
-        const studentPage = await notion.pages.retrieve({
-            page_id: studentId
-        });
-
-        // Debug: Ver la estructura real de la página del estudiante
-        const properties = (studentPage as any).properties;
-        const propertyKeys = Object.keys(properties || {});
-
-        console.log(`🔍 [getStudentNameFromNotion] Estructura de estudiante ${studentId}:`, {
-            propertyKeys,
-            sampleProperties: propertyKeys.slice(0, 5).reduce((acc: any, key: string) => {
-                acc[key] = {
-                    type: properties[key]?.type,
-                    hasTitle: !!properties[key]?.title,
-                    hasRichText: !!properties[key]?.rich_text,
-                    titleValue: properties[key]?.title?.[0]?.plain_text || null
-                };
-                return acc;
-            }, {})
-        });
-
-        // El nombre del estudiante está en el campo "Student"
-        if (properties?.Student) {
-            const studentProp = properties.Student;
-
-            // Puede ser un campo title
-            if (studentProp?.type === 'title' && studentProp?.title?.[0]?.plain_text) {
-                const name = studentProp.title[0].plain_text.trim();
-                if (name) {
-                    return name;
-                }
-            }
-
-            // Puede ser un campo rich_text
-            if (studentProp?.type === 'rich_text' && studentProp?.rich_text?.[0]?.plain_text) {
-                const name = studentProp.rich_text[0].plain_text.trim();
-                if (name) {
-                    return name;
-                }
-            }
-
-            // Puede ser un campo formula que retorna texto
-            if (studentProp?.type === 'formula' && studentProp?.formula?.string) {
-                const name = studentProp.formula.string.trim();
-                if (name) {
-                    return name;
-                }
-            }
-        }
-
-        // Fallback: buscar en campos title (nombre principal de la página)
-        for (const key of propertyKeys) {
-            const prop = properties[key];
-            if (prop?.type === 'title' && prop?.title?.[0]?.plain_text) {
-                const name = prop.title[0].plain_text.trim();
-                if (name) {
-                    return name;
-                }
-            }
-        }
-
-        // Si no se encuentra, retornar desconocido
-        console.log(`⚠️ [getStudentNameFromNotion] No se pudo extraer nombre del estudiante ${studentId}`);
-        return 'Estudiante desconocido';
-    } catch (error: any) {
-        console.error(`⚠️ [getStudentNameFromNotion] Error obteniendo estudiante ${studentId}:`, error.message);
-        return 'Estudiante desconocido';
+        return await lookupPromise;
+    } finally {
+        pendingStudentNameLookups.delete(studentId);
     }
 }
 
@@ -3606,21 +4449,13 @@ async function getStudentNameFromNotion(studentId: string): Promise<string> {
 async function getStudentNamesBatch(studentIds: string[]): Promise<Map<string, string>> {
     const studentNamesMap = new Map<string, string>();
     const uniqueIds = [...new Set(studentIds)];
-
-    // Hacer todas las consultas en paralelo
-    const promises = uniqueIds.map(async (id) => {
+    const results = await mapWithConcurrency(uniqueIds, 10, async (id) => {
         const name = await getStudentNameFromNotion(id);
         return { id, name };
     });
 
-    const results = await Promise.allSettled(promises);
-
-    results.forEach((result, index) => {
-        if (result.status === 'fulfilled') {
-            studentNamesMap.set(result.value.id, result.value.name);
-        } else {
-            studentNamesMap.set(uniqueIds[index], 'Estudiante desconocido');
-        }
+    results.forEach(({ id, name }) => {
+        studentNamesMap.set(id, name);
     });
 
     return studentNamesMap;
@@ -3640,11 +4475,47 @@ function mapMentorshipTypeFromNotion(notionType: string | null | undefined): 'Mo
     return 'Mentoría';
 }
 
+function getMentorNameVariants(...mentorNames: Array<string | null | undefined>): string[] {
+    const variants = new Set<string>();
+
+    mentorNames.forEach((mentorName) => {
+        const normalized = mentorName?.trim();
+        if (!normalized) return;
+
+        const parts = normalized.split(/\s+/).filter(Boolean);
+        variants.add(normalized);
+
+        if (parts.length >= 2) {
+            variants.add(`${parts[0]} ${parts[1]}`);
+        }
+
+        if (parts.length >= 3) {
+            variants.add(`${parts[0]} ${parts.slice(-2).join(' ')}`);
+        }
+    });
+
+    return Array.from(variants);
+}
+
+async function getCancellationMentorOptions(databaseId: string): Promise<string[]> {
+    const cachedOptions = getCachedValue(cancellationMentorOptionsCache, databaseId);
+    if (cachedOptions) {
+        return cachedOptions;
+    }
+
+    const database = await notion.databases.retrieve({ database_id: databaseId });
+    const options = ((database as any).properties?.['Mentor/a']?.select?.options || [])
+        .map((option: any) => option?.name)
+        .filter((value: any) => typeof value === 'string' && value.trim().length > 0);
+
+    return setCachedValue(cancellationMentorOptionsCache, databaseId, options);
+}
+
 /**
  * Helper: Consulta cancelaciones desde Notion con filtros
  */
 async function fetchCancellationsFromNotion(
-    mentorName: string,
+    mentorNames: string[],
     currentPeriod: { start: Date; end: Date },
     previousPeriod: { start: Date; end: Date }
 ): Promise<any[]> {
@@ -3655,8 +4526,13 @@ async function fetchCancellationsFromNotion(
     }
 
     // Extraer apellido del nombre completo (última palabra)
-    const nameParts = mentorName.trim().split(/\s+/);
-    const lastName = nameParts.length > 1 ? nameParts[nameParts.length - 1] : mentorName;
+    const availableMentorOptions = await getCancellationMentorOptions(CANCELLATIONS_DB);
+    const mentorNameVariants = getMentorNameVariants(...mentorNames)
+        .filter((value) => availableMentorOptions.includes(value));
+
+    if (!mentorNameVariants.length) {
+        return [];
+    }
 
     // Formatear fechas para Notion (ISO string sin tiempo para dates)
     const formatDateForNotion = (date: Date): string => {
@@ -3678,10 +4554,10 @@ async function fetchCancellationsFromNotion(
     const currentPeriodFilter = {
         and: [
             {
-                or: [
-                    { property: 'Mentor/a', select: { equals: mentorName } },
-                    { property: 'Mentor/a', select: { equals: lastName } }
-                ]
+                or: mentorNameVariants.map((value) => ({
+                    property: 'Mentor/a',
+                    select: { equals: value }
+                }))
             },
             {
                 property: 'Fecha y hora de mentoría',
@@ -3702,10 +4578,10 @@ async function fetchCancellationsFromNotion(
     const previousPeriodFilter = {
         and: [
             {
-                or: [
-                    { property: 'Mentor/a', select: { equals: mentorName } },
-                    { property: 'Mentor/a', select: { equals: lastName } }
-                ]
+                or: mentorNameVariants.map((value) => ({
+                    property: 'Mentor/a',
+                    select: { equals: value }
+                }))
             },
             {
                 property: 'Fecha y hora de mentoría',
@@ -4026,29 +4902,58 @@ async function createCancellationForReview(
     }
 }
 
-// Endpoint para obtener las mentorías del mentor autenticado
-app.get('/api/mentor/my-mentorships', authMiddleware, async (req, res) => {
+// Endpoint para obtener las mentorías del mentor autenticado o impersonado
+app.get('/api/mentor/my-mentorships', authMiddleware, authorizeMentorDataAccess(), async (req, res) => {
     try {
         // Obtener y validar query parameter periodType
         const periodType = (req.query.periodType as string) || 'academic';
+        const summaryOnly = req.query.summaryOnly === 'true';
         if (periodType !== 'academic' && periodType !== 'monthly') {
             return res.status(400).json({
                 error: 'periodType debe ser "academic" o "monthly"'
             });
         }
 
+        const requestedMentor = await resolveRequestedMentor(req);
+        const normalizedRequestedEmail = requestedMentor.email?.trim().toLowerCase() || '';
+        const providedImpersonationToken = getRequestImpersonationToken(req);
+        const mentorshipsCacheKey = buildCacheKey(
+            'mentor-mentorships',
+            requestedMentor.email,
+            requestedMentor.id,
+            periodType,
+            summaryOnly
+        );
+        const cachedMentorshipsResponse = getCachedValue(mentorMentorshipsResponseCache, mentorshipsCacheKey);
+        if (cachedMentorshipsResponse) {
+            return res.status(200).json(cachedMentorshipsResponse);
+        }
+
         // Obtener token del header Authorization (el middleware ya validó que existe)
         const authHeader = req.headers['authorization'] as string;
-        const token = authHeader.split(' ')[1];
-
-        // Obtener nombre del mentor
-        const userData = (req as any).user4GeeksData;
-        const mentorName = userData?.first_name && userData?.last_name
-            ? `${userData.first_name} ${userData.last_name}`
-            : userData?.username || 'Mentor';
-
-        // Obtener mentorías del API (consulta todas las academias en paralelo)
-        const sessions = await fetchMentorSessions(token, ALLOWED_ACADEMY_IDS.map(String));
+        const operatorToken = authHeader.split(' ')[1];
+        let token = operatorToken;
+        if (requestedMentor.isImpersonated) {
+            try {
+                token = providedImpersonationToken ||
+                    await fetchImpersonatedBreathcodeToken(
+                        operatorToken,
+                        requestedMentor.email,
+                        requestedMentor.memberId || null
+                    );
+            } catch (error: any) {
+                const message = error?.message || 'No se pudo obtener el token de impersonación';
+                const isForbidden = message.includes('403 Forbidden');
+                return res.status(isForbidden ? 403 : 502).json({
+                    error: isForbidden
+                        ? 'No tienes permisos para impersonar mentorías en BreatheCode con este usuario'
+                        : 'No se pudo obtener acceso a las mentorías del mentor solicitado',
+                    details: message,
+                    requestedEmail: requestedMentor.email,
+                });
+            }
+        }
+        const mentorName = requestedMentor.name || 'Mentor';
 
         // Calcular fechas de periodos según el tipo seleccionado
         const currentPeriod = periodType === 'monthly'
@@ -4057,6 +4962,47 @@ app.get('/api/mentor/my-mentorships', authMiddleware, async (req, res) => {
         const previousPeriod = periodType === 'monthly'
             ? getPreviousMonthlyPeriodDates()
             : getPreviousPeriodDates();
+
+        const mentorNameVariantsPromise = requestedMentor.isImpersonated
+            ? resolveBreathcodeMentorNameVariantsByEmail(operatorToken, requestedMentor.email)
+                .catch(() => getMentorNameVariants(mentorName))
+            : Promise.resolve(getMentorNameVariants(mentorName));
+
+        const cancellationsPromise = fetchCancellationsFromNotion(
+            await mentorNameVariantsPromise,
+            currentPeriod,
+            previousPeriod
+        );
+
+        const fetchMentorshipSessionsWithRetry = async () => {
+            try {
+                return await fetchMentorSessions(token, ALLOWED_ACADEMY_IDS.map(String));
+            } catch (error: any) {
+                const message = error?.message || '';
+                const shouldRefreshImpersonationToken =
+                    requestedMentor.isImpersonated &&
+                    !providedImpersonationToken &&
+                    normalizedRequestedEmail &&
+                    (message.includes('401') || message.includes('403'));
+
+                if (!shouldRefreshImpersonationToken) {
+                    throw error;
+                }
+
+                breathcodeImpersonationTokenCache.delete(normalizedRequestedEmail);
+                token = await fetchImpersonatedBreathcodeToken(
+                    operatorToken,
+                    requestedMentor.email,
+                    requestedMentor.memberId || null
+                );
+                return fetchMentorSessions(token, ALLOWED_ACADEMY_IDS.map(String));
+            }
+        };
+
+        const [sessions, cancellations] = await Promise.all([
+            fetchMentorshipSessionsWithRetry(),
+            cancellationsPromise
+        ]);
 
         // Procesar mentorías
         const processedMentorships: ProcessedMentorship[] = [];
@@ -4116,17 +5062,99 @@ app.get('/api/mentor/my-mentorships', authMiddleware, async (req, res) => {
             });
         });
 
-        // Generar resúmenes mensuales
+        const studentIds: string[] = [];
+        cancellations.forEach((cancellation: any) => {
+            const studentRelation = cancellation.properties?.['Estudiante']?.relation;
+            if (studentRelation?.[0]?.id) {
+                studentIds.push(studentRelation[0].id);
+            }
+        });
+
+        const studentNamesMap = await getStudentNamesBatch(studentIds);
+        const mentorNamesForValidation = (await mentorNameVariantsPromise)
+            .map((value) => value.trim().toLowerCase());
+
+        cancellations.forEach((cancellation: any) => {
+            const properties = cancellation.properties || {};
+            const cancellationMentor = properties['Mentor/a']?.select?.name?.trim().toLowerCase();
+            if (!cancellationMentor || !mentorNamesForValidation.includes(cancellationMentor)) {
+                return;
+            }
+
+            const mentorshipDateProp = properties['Fecha y hora de mentoría']?.date;
+            if (!mentorshipDateProp?.start) {
+                return;
+            }
+
+            const mentorshipDate = new Date(mentorshipDateProp.start);
+            let period: 'current' | 'previous' | null = null;
+            if (mentorshipDate >= currentPeriod.start && mentorshipDate <= currentPeriod.end) {
+                period = 'current';
+            } else if (mentorshipDate >= previousPeriod.start && mentorshipDate <= previousPeriod.end) {
+                period = 'previous';
+            } else {
+                return;
+            }
+
+            const studentRelation = properties['Estudiante']?.relation;
+            const studentId = studentRelation?.[0]?.id || null;
+            const student = studentId ? studentNamesMap.get(studentId) || 'Estudiante desconocido' : 'Estudiante desconocido';
+            const mentorshipType = properties['Tipo de mentoría']?.select?.name || null;
+            const service = mapMentorshipTypeFromNotion(mentorshipType);
+            const cancellationDateProp = properties['Fecha y hora de cancelación']?.date;
+            const cancellationDate = cancellationDateProp?.start
+                ? new Date(cancellationDateProp.start).toISOString()
+                : '';
+            const cancellationReason = properties['Motivo de reprogramación']?.select?.name || '';
+            const notesProp = properties['Notas']?.rich_text;
+            const notes = notesProp && Array.isArray(notesProp) && notesProp.length > 0
+                ? notesProp.map((text: any) => text.plain_text || '').join(' ')
+                : '';
+            const statusProp = properties['Status'];
+            let status: 'A pagar' | 'No corresponde' = 'No corresponde';
+
+            if (statusProp?.formula?.string) {
+                status = statusProp.formula.string === 'A pagar' ? 'A pagar' : 'No corresponde';
+            } else if (statusProp?.formula?.boolean !== undefined) {
+                status = statusProp.formula.boolean ? 'A pagar' : 'No corresponde';
+            } else if (statusProp?.rich_text?.[0]?.plain_text) {
+                status = statusProp.rich_text[0].plain_text === 'A pagar' ? 'A pagar' : 'No corresponde';
+            } else if (statusProp?.select?.name) {
+                status = statusProp.select.name === 'A pagar' ? 'A pagar' : 'No corresponde';
+            }
+
+            processedMentorships.push({
+                id: cancellation.id,
+                student,
+                service,
+                startTime: mentorshipDate.toISOString(),
+                endTime: '',
+                duration: 0,
+                status,
+                canRequestReview: status === 'No corresponde',
+                period,
+                isCancelled: true,
+                cancellationDate,
+                cancellationReason,
+                notes,
+            });
+        });
+
+        const uniqueMentorships = Array.from(
+            new Map(processedMentorships.map((mentorship) => [mentorship.id, mentorship])).values()
+        );
+
         const monthlySummaries = generateMonthlySummaries(
-            processedMentorships,
+            uniqueMentorships,
             currentPeriod,
             previousPeriod
         );
 
-        // Retornar respuesta en el formato esperado
-        res.status(200).json({
+        const responsePayload = {
             mentorName,
-            mentorships: processedMentorships.map((m) => ({
+            impersonated: requestedMentor.isImpersonated,
+            requestedEmail: requestedMentor.email,
+            mentorships: summaryOnly ? [] : uniqueMentorships.map((m) => ({
                 id: m.id,
                 student: m.student,
                 service: m.service,
@@ -4135,9 +5163,23 @@ app.get('/api/mentor/my-mentorships', authMiddleware, async (req, res) => {
                 duration: m.duration,
                 status: m.status,
                 canRequestReview: m.canRequestReview,
+                isCancelled: m.isCancelled || false,
+                cancellationDate: m.cancellationDate || '',
+                cancellationReason: m.cancellationReason || '',
+                notes: m.notes || '',
             })),
             monthlySummaries,
-        });
+            summaryOnly,
+        };
+
+        setCachedValue(
+            mentorMentorshipsResponseCache,
+            mentorshipsCacheKey,
+            responsePayload,
+            MENTOR_RESPONSE_CACHE_TTL_MS
+        );
+
+        res.status(200).json(responsePayload);
     } catch (error: any) {
         console.error('❌ [mentor/my-mentorships] Error:', {
             error: error.message,
@@ -4198,9 +5240,7 @@ app.get('/api/mentor/cancelled-mentorships', authMiddleware, async (req, res) =>
         const processedCancellations: any[] = [];
 
         // Preparar nombres para validación (nombre completo y apellido)
-        const nameParts = mentorName.trim().split(/\s+/);
-        const lastName = nameParts.length > 1 ? nameParts[nameParts.length - 1] : mentorName;
-        const mentorNamesForValidation = [mentorName, lastName];
+        const mentorNamesForValidation = getMentorNameVariants(mentorName);
 
         cancellations.forEach((cancellation: any) => {
             const properties = cancellation.properties || {};
@@ -4453,6 +5493,8 @@ app.post('/api/mentor/request-review', authMiddleware, async (req, res) => {
             wasCreated = true;
             console.log(`✅ [request-review] Nueva cancelación ${cancellationPageId} creada con toda la información`);
         }
+
+        clearMentorDataCaches();
 
         // Retornar respuesta
         res.status(200).json({
