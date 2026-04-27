@@ -190,8 +190,11 @@ const notion = new Client({
     logLevel: LogLevel.DEBUG
 });
 
-// Configuración del NotionAPI de react-notion-x
-const notionX = new NotionAPI();
+// NotionAPI (notion-client): 7.3.x dejó de funcionar con cambios de Notion; usar ≥7.6 (p. ej. 7.10).
+// authToken: para páginas del workspace; sin token solo funcionan endpoints pensados para páginas públicas.
+const notionX = process.env.NOTION_TOKEN
+    ? new NotionAPI({ authToken: process.env.NOTION_TOKEN })
+    : new NotionAPI();
 
 async function notionApiFetch<T = any>(url: string, init: any): Promise<T> {
     const response = await fetch(url, {
@@ -1320,8 +1323,13 @@ app.post('/api/notion-page', authorizeRoles(), async (req, res) => {
             recordMap
         });
     } catch (error) {
-        console.error('Error obteniendo contenido de la página de Notion:', error);
-        res.status(500).json({ error: 'Error al obtener el contenido de la página' });
+        const err = error as Error;
+        console.error('Error obteniendo contenido de la página de Notion:', err);
+        const detail =
+            err?.message && String(err.message).trim()
+                ? err.message
+                : 'Error al obtener el contenido de la página';
+        res.status(500).json({ error: 'Error al obtener el contenido de la página', detail });
     }
 });
 
