@@ -23,9 +23,9 @@
 		"express": "^4.21.2",
 		"multer": "^2.1.1",
 		"node-fetch": "^3.3.2",
-		"notion-client": "^7.3.0",
-		"notion-types": "^7.3.0",
-		"notion-utils": "^7.3.0"
+		"notion-client": "^7.10.0",
+		"notion-types": "^7.10.0",
+		"notion-utils": "^7.10.0"
 	},
 	"devDependencies": {
 		"@types/body-parser": "^1.19.5",
