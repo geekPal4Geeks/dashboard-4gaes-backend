@@ -146,11 +146,20 @@ const notion = new Client({
     auth: process.env.NOTION_TOKEN,
     logLevel: LogLevel.DEBUG
 });
-// NotionAPI (notion-client): 7.3.x dejó de funcionar con cambios de Notion; usar ≥7.6 (p. ej. 7.10).
-// authToken: para páginas del workspace; sin token solo funcionan endpoints pensados para páginas públicas.
-const notionX = process.env.NOTION_TOKEN
-    ? new NotionAPI({ authToken: process.env.NOTION_TOKEN })
-    : new NotionAPI();
+// NotionAPI (notion-client): getPage() usa la API v3 no documentada.
+// Las guías en *.notion.site se sirven desde ese subdominio; apuntar a www.notion.so suele dejar de devolver el recordMap.
+// NOTION_V3_USE_INTEGRATION_TOKEN=true + NOTION_TOKEN: solo si hace falta; el "secret_..." a veces no es válido para v3.
+const envUnofficialBase = (process.env.NOTION_UNOFFICIAL_API_BASE || '')
+    .trim()
+    .replace(/\/$/, '');
+const NOTION_UNOFFICIAL_API_BASE = envUnofficialBase || 'https://4geeksacademy.notion.site/api/v3';
+const notionXV3Auth = process.env.NOTION_V3_USE_INTEGRATION_TOKEN === 'true' && process.env.NOTION_TOKEN
+    ? { authToken: process.env.NOTION_TOKEN }
+    : {};
+const notionX = new NotionAPI({
+    apiBaseUrl: NOTION_UNOFFICIAL_API_BASE,
+    ...notionXV3Auth,
+});
 async function notionApiFetch(url, init) {
     const response = await fetch(url, {
         ...init,
