@@ -2021,20 +2021,28 @@ async function resolveRequestedMentor(req: Request) {
     const roles = (req as any).user4GeeksData?.roles || [];
     const canImpersonate = hasAllowedAcademyRole(roles, ['academy_coordinator', 'admin']);
 
+    const tokenRole = (userRoles: any[]): 'teacher' | 'assistant' | null =>
+        hasAllowedAcademyRole(userRoles || [], ['teacher'])
+            ? 'teacher'
+            : hasAllowedAcademyRole(userRoles || [], ['assistant'])
+                ? 'assistant'
+                : null;
+
     if (requestedEmail && canImpersonate) {
         const page = await findMentorByEmail(requestedEmail);
         const name =
             page.properties?.Name?.title?.[0]?.plain_text ||
             page.properties?.Title?.title?.[0]?.plain_text ||
             requestedEmail;
-        const effectiveRole = await detectMentorCurrentRoleByNotionId(page.id);
+        const notionRole = await detectMentorCurrentRoleByNotionId(page.id);
 
         return {
             id: page.id,
             email: requestedEmail,
             name: name?.trim() || requestedEmail,
             isImpersonated: true,
-            effectiveRole,
+            effectiveRole: notionRole,
+            effectiveRoleSource: notionRole ? 'notion' as const : null,
             memberId: requestedMemberId || null,
         };
     }
@@ -2045,15 +2053,20 @@ async function resolveRequestedMentor(req: Request) {
         ? `${userData.first_name} ${userData.last_name}`
         : userData?.username || 'Mentor';
 
+    // Misma fuente que impersonación: Notion primero; JWT solo como fallback.
+    const notionRole = await detectMentorCurrentRoleByNotionId(mentorId);
+    const fallbackTokenRole = tokenRole(userData?.roles || []);
+
     return {
         id: mentorId,
         email: userData?.email || null,
         name: mentorName,
         isImpersonated: false,
-        effectiveRole: hasAllowedAcademyRole(userData?.roles || [], ['teacher'])
-            ? 'teacher'
-            : hasAllowedAcademyRole(userData?.roles || [], ['assistant'])
-                ? 'assistant'
+        effectiveRole: notionRole || fallbackTokenRole,
+        effectiveRoleSource: notionRole
+            ? 'notion' as const
+            : fallbackTokenRole
+                ? 'token' as const
                 : null,
         memberId: null,
     };
@@ -2457,15 +2470,22 @@ app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
         }
 
         const userRoles = (req as any).user4GeeksData?.roles || [];
-        const fallbackRole = hasAllowedAcademyRole(userRoles, ['teacher'])
-            ? 'teacher'
-            : hasAllowedAcademyRole(userRoles, ['assistant'])
-                ? 'assistant'
-                : null;
+        // Fallback de rol del token solo aplica a cuenta propia (no al impersonador).
+        const fallbackRole = !requestedMentor.isImpersonated
+            ? (hasAllowedAcademyRole(userRoles, ['teacher'])
+                ? 'teacher'
+                : hasAllowedAcademyRole(userRoles, ['assistant'])
+                    ? 'assistant'
+                    : null)
+            : null;
         let effectiveRole: 'teacher' | 'assistant' | null =
             requestedMentor.effectiveRole === 'teacher' || requestedMentor.effectiveRole === 'assistant'
                 ? requestedMentor.effectiveRole
                 : fallbackRole;
+        let effectiveRoleSource: 'notion' | 'token' | null =
+            requestedMentor.effectiveRoleSource === 'notion' || requestedMentor.effectiveRoleSource === 'token'
+                ? requestedMentor.effectiveRoleSource
+                : (!requestedMentor.effectiveRole && fallbackRole ? 'token' : null);
 
         const COHORTS_DB_FOR_EVALS_SEARCH = process.env.NOTION_COHORTS_DATABASE_ID || process.env.NOTION_DATABASE_ID || '';
         if (!COHORTS_DB_FOR_EVALS_SEARCH) {
@@ -2549,11 +2569,16 @@ app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
                     (teacherRollupResult.status === 'fulfilled' ? teacherRollupResult.value.results?.length || 0 : 0) > 0;
 
                 if (!effectiveRole) {
-                    effectiveRole = hasTeacherAssignments
-                        ? 'teacher'
-                        : hasAssistantAssignments
-                            ? 'assistant'
-                            : fallbackRole;
+                    if (hasTeacherAssignments) {
+                        effectiveRole = 'teacher';
+                        effectiveRoleSource = 'notion';
+                    } else if (hasAssistantAssignments) {
+                        effectiveRole = 'assistant';
+                        effectiveRoleSource = 'notion';
+                    } else if (fallbackRole) {
+                        effectiveRole = fallbackRole;
+                        effectiveRoleSource = 'token';
+                    }
                 }
 
                 // Guardar IDs y páginas para evitar consultas posteriores
@@ -2628,79 +2653,34 @@ app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
             if (allPages.length === 0 && !foundCohortIdsInSearch) {
                 const fallbackPages = new Set<string>();
 
-                if (effectiveRole === 'assistant') {
-                    // Intentar T.A. directo
-                    try {
-                        const taDirectFilter: any = { property: 'T.A.', relation: { contains: originalMentorId } };
-                        if (startDate || endDate) {
-                            const andFilters: any[] = [taDirectFilter];
-                            if (startDate) andFilters.push({ property: 'NPS ID', title: { starts_with: startDate.substring(0, 7) } });
-                            if (endDate) andFilters.push({ property: 'NPS ID', title: { starts_with: endDate.substring(0, 7) } });
-                            const results = await notionQueryAll(NPS_DB, { and: andFilters });
-                            results.forEach((page: any) => fallbackPages.add(page.id));
-                        } else {
-                            const results = await notionQueryAll(NPS_DB, taDirectFilter);
-                            results.forEach((page: any) => fallbackPages.add(page.id));
-                        }
-                    } catch (error: any) {
-                        // Ignorar errores
-                    }
+                // Buscar por T.A. y Teacher (ambos), sin limitar a un único rol global
+                const roleFilters: any[] = [
+                    { property: 'T.A.', relation: { contains: originalMentorId } },
+                    {
+                        property: 'T.A.',
+                        rollup: { any: { relation: { contains: originalMentorId } } }
+                    },
+                    { property: 'Teacher', relation: { contains: originalMentorId } },
+                    {
+                        property: 'Teacher',
+                        rollup: { any: { relation: { contains: originalMentorId } } }
+                    },
+                ];
 
-                    // Intentar T.A. rollup
+                for (const roleFilter of roleFilters) {
                     try {
-                        const taRollupFilter: any = {
-                            property: 'T.A.',
-                            rollup: { any: { relation: { contains: originalMentorId } } }
-                        };
                         if (startDate || endDate) {
-                            const andFilters: any[] = [taRollupFilter];
+                            const andFilters: any[] = [roleFilter];
                             if (startDate) andFilters.push({ property: 'NPS ID', title: { starts_with: startDate.substring(0, 7) } });
                             if (endDate) andFilters.push({ property: 'NPS ID', title: { starts_with: endDate.substring(0, 7) } });
                             const results = await notionQueryAll(NPS_DB, { and: andFilters });
                             results.forEach((page: any) => fallbackPages.add(page.id));
                         } else {
-                            const results = await notionQueryAll(NPS_DB, taRollupFilter);
+                            const results = await notionQueryAll(NPS_DB, roleFilter);
                             results.forEach((page: any) => fallbackPages.add(page.id));
                         }
                     } catch (error: any) {
-                        // Ignorar errores
-                    }
-                } else {
-                    // Intentar Teacher directo
-                    try {
-                        const teacherDirectFilter: any = { property: 'Teacher', relation: { contains: originalMentorId } };
-                        if (startDate || endDate) {
-                            const andFilters: any[] = [teacherDirectFilter];
-                            if (startDate) andFilters.push({ property: 'NPS ID', title: { starts_with: startDate.substring(0, 7) } });
-                            if (endDate) andFilters.push({ property: 'NPS ID', title: { starts_with: endDate.substring(0, 7) } });
-                            const results = await notionQueryAll(NPS_DB, { and: andFilters });
-                            results.forEach((page: any) => fallbackPages.add(page.id));
-                        } else {
-                            const results = await notionQueryAll(NPS_DB, teacherDirectFilter);
-                            results.forEach((page: any) => fallbackPages.add(page.id));
-                        }
-                    } catch (error: any) {
-                        // Ignorar errores
-                    }
-
-                    // Intentar Teacher rollup
-                    try {
-                        const teacherRollupFilter: any = {
-                            property: 'Teacher',
-                            rollup: { any: { relation: { contains: originalMentorId } } }
-                        };
-                        if (startDate || endDate) {
-                            const andFilters: any[] = [teacherRollupFilter];
-                            if (startDate) andFilters.push({ property: 'NPS ID', title: { starts_with: startDate.substring(0, 7) } });
-                            if (endDate) andFilters.push({ property: 'NPS ID', title: { starts_with: endDate.substring(0, 7) } });
-                            const results = await notionQueryAll(NPS_DB, { and: andFilters });
-                            results.forEach((page: any) => fallbackPages.add(page.id));
-                        } else {
-                            const results = await notionQueryAll(NPS_DB, teacherRollupFilter);
-                            results.forEach((page: any) => fallbackPages.add(page.id));
-                        }
-                    } catch (error: any) {
-                        // Ignorar errores
+                        // Ignorar errores de un filtro concreto
                     }
                 }
 
@@ -2728,11 +2708,11 @@ app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
             });
         }
 
-        // Filtrar evaluaciones que realmente corresponden al mentor actual.
-        // Si el mentor hoy es teacher, priorizamos solo evaluaciones teacher.
-        // Si hoy es assistant, priorizamos solo evaluaciones TA.
+        // Filtrar por asignación real en cada evaluación (TA y/o Teacher).
+        // No forzar un único rol global que omitiría evaluaciones del otro rol.
         const pages: any[] = [];
         const skippedEvaluations: any[] = [];
+        const mentorRoleByEvalId = new Map<string, 'assistant' | 'teacher' | 'both'>();
 
         for (const page of allPages) {
             const props = (page as any).properties || {};
@@ -2748,22 +2728,22 @@ app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
             const teacherRelation = props['Teacher']?.relation || props['Teacher']?.rollup?.array?.[0]?.relation || [];
             const teacherIds = teacherRelation.map((t: any) => t.id);
             const normalizedTeacherIds = teacherIds.map((id: string) => id.replace(/-/g, ''));
+            const isListedAsTeacher = normalizedTeacherIds.includes(normalizedMentorId);
 
-            // Si el rol efectivo actual es assistant, solo incluir evaluaciones TA
-            if (effectiveRole === 'assistant' && isMentorTA) {
-                pages.push(page);
+            let includedAsTA = false;
+            let includedAsTeacher = false;
+
+            if (isMentorTA) {
+                includedAsTA = true;
             }
-            // Si el rol efectivo actual es teacher, solo incluir evaluaciones teacher
-            else if (effectiveRole === 'teacher' && normalizedTeacherIds.includes(normalizedMentorId)) {
-                const mentorChangeDate = props['Mentor Change Date']?.rollup?.array?.[0]?.date?.start || null;
 
-                // Extraer fecha de evaluación
+            if (isListedAsTeacher) {
+                const mentorChangeDate = props['Mentor Change Date']?.rollup?.array?.[0]?.date?.start || null;
                 const evaluationDate = props['Date of Creation']?.date?.start ||
                     props['Date of Creation']?.rich_text?.[0]?.plain_text ||
                     page.created_time ||
                     props['NPS ID']?.title?.[0]?.plain_text || '';
 
-                // Determinar si el mentor actual es responsable de esta evaluación
                 const responsibility = isMentorResponsibleForEvaluation(
                     evaluationDate,
                     mentorChangeDate,
@@ -2772,8 +2752,8 @@ app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
                 );
 
                 if (responsibility.isResponsible) {
-                    pages.push(page);
-                } else {
+                    includedAsTeacher = true;
+                } else if (!isMentorTA) {
                     skippedEvaluations.push({
                         npsId,
                         reason: responsibility.reason,
@@ -2782,52 +2762,28 @@ app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
                         teacherIds
                     });
                 }
-            } else if (!effectiveRole) {
-                if (isMentorTA) {
-                    pages.push(page);
-                } else if (normalizedTeacherIds.includes(normalizedMentorId)) {
-                    const mentorChangeDate = props['Mentor Change Date']?.rollup?.array?.[0]?.date?.start || null;
-                    const evaluationDate = props['Date of Creation']?.date?.start ||
-                        props['Date of Creation']?.rich_text?.[0]?.plain_text ||
-                        page.created_time ||
-                        props['NPS ID']?.title?.[0]?.plain_text || '';
+            }
 
-                    const responsibility = isMentorResponsibleForEvaluation(
-                        evaluationDate,
-                        mentorChangeDate,
-                        teacherIds,
-                        normalizedMentorId
-                    );
-
-                    if (responsibility.isResponsible) {
-                        pages.push(page);
-                    } else {
-                        skippedEvaluations.push({
-                            npsId,
-                            reason: responsibility.reason,
-                            evaluationDate,
-                            mentorChangeDate,
-                            teacherIds
-                        });
-                    }
-                } else {
-                    skippedEvaluations.push({
-                        npsId,
-                        reason: 'Mentor no está como TA ni como Teacher en la evaluación',
-                        evaluationDate: props['Date of Creation']?.date?.start || page.created_time,
-                        mentorChangeDate: null,
-                        teacherIds
-                    });
-                }
-            } else {
+            if (includedAsTA || includedAsTeacher) {
+                pages.push(page);
+                mentorRoleByEvalId.set(
+                    page.id,
+                    includedAsTA && includedAsTeacher
+                        ? 'both'
+                        : includedAsTA
+                            ? 'assistant'
+                            : 'teacher'
+                );
+            } else if (!isListedAsTeacher) {
                 skippedEvaluations.push({
                     npsId,
-                    reason: `Evaluación omitida por rol efectivo actual (${effectiveRole})`,
+                    reason: 'Mentor no está como TA ni como Teacher en la evaluación',
                     evaluationDate: props['Date of Creation']?.date?.start || page.created_time,
                     mentorChangeDate: null,
                     teacherIds
                 });
             }
+            // Si está listado como Teacher pero no es responsable y no es TA, ya se omitió arriba.
         }
 
         // Los comentarios se cargan bajo demanda desde /api/nps-comments
@@ -2891,7 +2847,8 @@ app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
                 npsId;
 
             // Para teacher sí aplicamos validaciones de cambio de mentor
-            if (effectiveRole !== 'assistant') {
+            const mentorEvalRole = mentorRoleByEvalId.get(page.id);
+            if (mentorEvalRole === 'teacher' || mentorEvalRole === 'both') {
                 // Validar datos de cambio de mentor (solo para teachers)
                 const validation = validateMentorChangeData(teacherIds, mentorChangeDate, evaluationDate);
                 if (!validation.isValid) {
@@ -3154,21 +3111,33 @@ app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
             }
         }
 
-        // Métricas generales del mentor
-        let allScores: number[];
-        if (effectiveRole === 'assistant') {
-            // Para assistants, usar TA Score
-            allScores = Array.from(byCohort.values())
-                .flatMap(x => x.items.map(i => i.taScores))
-                .filter(s => s !== null && s !== undefined && s >= 0);
-        } else {
-            // Para teachers, usar Teacher Score
-            allScores = Array.from(byCohort.values())
-                .flatMap(x => x.items.map(i => i.teacherScore))
-                .filter(s => s !== null && s !== undefined && s >= 0);
+        // Métricas generales del mentor: score según rol real en cada evaluación
+        const allScores: number[] = [];
+        for (const page of pages) {
+            const props = (page as any).properties || {};
+            const roleOnEval = mentorRoleByEvalId.get(page.id);
+            const teacherScore = props['Teacher Score']?.number;
+            let taScores: number | null = null;
+            if (props['TA Score']?.formula?.number !== undefined) {
+                taScores = props['TA Score']?.formula?.number;
+            } else if (props['TAs Scores']?.rich_text?.[0]?.plain_text) {
+                const scoreMatch = props['TAs Scores'].rich_text[0].plain_text.match(/(\d+\.?\d*)/);
+                if (scoreMatch) {
+                    taScores = parseFloat(scoreMatch[1]);
+                }
+            }
+
+            if ((roleOnEval === 'assistant' || roleOnEval === 'both') && taScores !== null && taScores >= 0) {
+                allScores.push(taScores);
+            }
+            if ((roleOnEval === 'teacher' || roleOnEval === 'both') &&
+                teacherScore !== null && teacherScore !== undefined && teacherScore >= 0) {
+                allScores.push(teacherScore);
+            }
         }
 
         const overall = computeNps(allScores);
+        const primaryScoreType = effectiveRole === 'assistant' ? 'TA Score' : 'Teacher Score';
 
         const mentorName = requestedMentor.name || 'Mentor';
         const baseKpis = {
@@ -3198,7 +3167,7 @@ app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
                 Array.from(byCohort.values())
                     .flatMap(x => x.items.map(i => i.participation))
                     .filter(p => p > 0).length || 0,
-            scoreType: effectiveRole === 'assistant' ? 'TA Score' : 'Teacher Score'
+            scoreType: primaryScoreType
         };
         const baseMetadata = {
             mentorId: originalMentorId,
@@ -3239,7 +3208,7 @@ app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
                 overall: {
                     teacherAverage: overall.avg,
                     totalEvaluations: overall.count,
-                    scoreType: effectiveRole === 'assistant' ? 'TA Score' : 'Teacher Score'
+                    scoreType: primaryScoreType
                 },
                 totalCohorts: resultActive.length + resultPast.length,
                 totalEvaluations: validationStats.assignedEvaluations,
@@ -3247,6 +3216,7 @@ app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
                 mentorName,
                 userRole: effectiveRole || 'teacher',
                 effectiveRole,
+                effectiveRoleSource,
                 visualizationData: {
                     cohorts: [],
                     charts: {
@@ -3505,7 +3475,7 @@ app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
             overall: {
                 teacherAverage: overall.avg,
                 totalEvaluations: overall.count,
-                scoreType: effectiveRole === 'assistant' ? 'TA Score' : 'Teacher Score'
+                scoreType: primaryScoreType
             },
             totalCohorts: resultActive.length + resultPast.length,
             totalEvaluations: validationStats.assignedEvaluations,
@@ -3513,6 +3483,7 @@ app.post('/api/mentor-nps', authorizeMentorDataAccess(), async (req, res) => {
             mentorName,
             userRole: effectiveRole || 'teacher',
             effectiveRole,
+            effectiveRoleSource,
             visualizationData: safeVisualizationData,
             totalComments: Array.from(commentsMap.values()).flat().length,
             impersonated: requestedMentor.isImpersonated,
